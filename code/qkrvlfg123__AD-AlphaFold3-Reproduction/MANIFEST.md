@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction
 - 快照日期: 2026-11-22
-- 快照 commit: [`7480eae6d8ae`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/commit/7480eae6d8aec196d07f19661d205749476c44e4)
+- 快照 commit: [`f606a50b5509`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/commit/f606a50b550930ed59d854817c771d2890d8d45b)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (37 个文件, 330.9 KB)

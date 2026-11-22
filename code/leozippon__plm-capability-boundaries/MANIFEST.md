@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/leozippon/plm-capability-boundaries
 - 快照日期: 2026-11-22
-- 快照 commit: [`3c5282575e78`](https://github.com/leozippon/plm-capability-boundaries/commit/3c5282575e782c07116ebac968fa21223850624f)
+- 快照 commit: [`9dfe26865587`](https://github.com/leozippon/plm-capability-boundaries/commit/9dfe2686558779b6d41919add2426f2e5912f9cf)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (835 个文件, 16.5 MB)

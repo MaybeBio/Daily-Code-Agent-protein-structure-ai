@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/bigict/ProFOLD2
 - 快照日期: 2026-11-22
-- 快照 commit: [`7824625b1a2a`](https://github.com/bigict/ProFOLD2/commit/7824625b1a2a21c8a3237a937bb199d7ca77f8e4)
+- 快照 commit: [`94e03c6444c2`](https://github.com/bigict/ProFOLD2/commit/94e03c6444c25ef102babef758c0972a6d257428)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (166 个文件, 3.3 MB)
@@ -14,7 +14,7 @@
 | 文档 | 4 | 2.7 KB |
 | README | 2 | 2.2 KB |
 
-按后缀: `.js` 12 (1.0 MB)、`.py` 90 (919.4 KB)、`.h` 23 (591.2 KB)、`.css` 12 (398.4 KB)、`.html` 11 (250.2 KB)、`.scss` 1 (206.2 KB)、`.cu` 2 (17.1 KB)、`.md` 5 (3.9 KB)、`.cpp` 1 (2.1 KB)、`Dockerfile` 1 (1.8 KB)、`.sh` 1 (1.6 KB)、`setup.py` 1 (1.2 KB)、`无后缀` 1 (1.0 KB)、`.yml` 2 (753 B)、`.txt` 2 (141 B)、`setup.cfg` 1 (0 B)
+按后缀: `.js` 12 (1.0 MB)、`.py` 90 (922.9 KB)、`.h` 23 (591.2 KB)、`.css` 12 (398.4 KB)、`.html` 11 (250.2 KB)、`.scss` 1 (206.2 KB)、`.cu` 2 (17.1 KB)、`.md` 5 (3.9 KB)、`.cpp` 1 (2.1 KB)、`Dockerfile` 1 (1.8 KB)、`.sh` 1 (1.6 KB)、`setup.py` 1 (1.2 KB)、`无后缀` 1 (1.0 KB)、`.yml` 2 (753 B)、`.txt` 2 (141 B)、`setup.cfg` 1 (0 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

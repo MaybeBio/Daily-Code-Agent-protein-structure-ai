@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/brucefan1983/GPUMD
 - 快照日期: 2026-11-22
-- 快照 commit: [`15a5bdb44003`](https://github.com/brucefan1983/GPUMD/commit/15a5bdb44003acac542a916fe015605ef3e9c95f)
+- 快照 commit: [`f4e40a2755d2`](https://github.com/brucefan1983/GPUMD/commit/f4e40a2755d2fba345bc8a514d095da4801f182c)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (944 个文件, 9.6 MB)
+## 保留 (952 个文件, 9.7 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 662 | 8.5 MB |
-| 文档 | 233 | 882.6 KB |
+| 源码 | 668 | 8.5 MB |
+| 文档 | 234 | 889.5 KB |
 | 构建/配置 | 13 | 215.7 KB |
-| README | 36 | 94.8 KB |
+| README | 37 | 100.6 KB |
 
-按后缀: `.cu` 235 (3.7 MB)、`.cuh` 261 (2.4 MB)、`.h` 3 (1.2 MB)、`.py` 111 (995.6 KB)、`.rst` 223 (561.0 KB)、`.bib` 1 (239.4 KB)、`manifest.json` 3 (200.5 KB)、`.cpp` 4 (196.5 KB)、`.md` 44 (176.9 KB)、`.m` 31 (36.4 KB)、`.sh` 10 (33.8 KB)、`.yml` 6 (5.9 KB)、`makefile` 1 (5.3 KB)、`.pl` 1 (4.2 KB)、`CMakeLists.txt` 1 (3.1 KB)、`.tcl` 1 (2.3 KB)、`.html` 3 (2.1 KB)、`.css` 1 (1.3 KB)、`.groovy` 1 (772 B)、`Dockerfile` 1 (737 B)、`.ini` 1 (270 B)、`无后缀` 1 (15 B)
+按后缀: `.cu` 235 (3.7 MB)、`.cuh` 262 (2.4 MB)、`.h` 3 (1.2 MB)、`.py` 116 (1.0 MB)、`.rst` 224 (565.6 KB)、`.bib` 1 (240.6 KB)、`manifest.json` 3 (200.5 KB)、`.cpp` 4 (196.5 KB)、`.md` 45 (183.9 KB)、`.m` 31 (36.4 KB)、`.sh` 10 (33.8 KB)、`.yml` 6 (5.9 KB)、`makefile` 1 (5.3 KB)、`.pl` 1 (4.2 KB)、`CMakeLists.txt` 1 (3.1 KB)、`.tcl` 1 (2.3 KB)、`.html` 3 (2.1 KB)、`.css` 1 (1.3 KB)、`.groovy` 1 (772 B)、`Dockerfile` 1 (737 B)、`.ini` 1 (270 B)、`无后缀` 1 (15 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

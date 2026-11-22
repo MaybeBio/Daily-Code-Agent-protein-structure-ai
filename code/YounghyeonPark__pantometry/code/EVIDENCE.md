@@ -316,6 +316,29 @@ radiating or not, and the order is four to within 2.2e-5 —
 one above with a narrower edge: a test that removes a non-linearity to keep its closed form exact
 has said nothing about the non-linear case, and the rate has to be measured there as well.
 
+### And inside a void
+
+`air_in` came after the series form and was written as the film had been before it: `h·dx²` a
+face, charged against the cell centre. Every cell facing the air sat too cold by exactly the half
+cell's drop, `q''·dx/2k` — 333.3 K at 4 mm a cell on a slab of `k = 0.6` shedding 100 kW/m² into
+air at `h = 200`, and 41.67 K at 0.5 mm, halving with the cell — where the same slab cooled through
+an outer face met its closed form to 1e-13 K. Nothing had measured the air's order. Its tests were
+lumped balances of copper, whose half cell is a quarter of a percent of the path, held to the time
+step's error, which was larger. `crates/pantometry-thermal/tests/the_air_in_a_void_cools_at_the_surface.rs`
+measures four now, with the void on each of the six sides of a column. A boundary corrected is one
+boundary: the next one written in the old form has to have its rate measured on its own.
+
+The clearance was the last of them. A pair of cells facing each other across void exchanged
+`σA(T₁⁴ − T₂⁴)/(1/ε₁ + 1/ε₂ − 1)` between their two centres, each a half cell's drop from the
+surface that radiates; on two slabs across a vacuum the heated one sat 24.8 K too cold at 4 mm a
+cell and 3.13 K at 0.5 mm, 1.99 a halving, and with air in the clearance the other slab was wrong
+too, because the air's share of each face moves with its surface. The two surfaces solved for
+together, each behind its own half cell and beside its air, both slabs meet the scheme's own closed
+form at every cell and the order is four —
+`crates/pantometry-thermal/tests/a_clearance_radiates_between_its_surfaces.rs`. With air the pair is
+no longer antisymmetric, and the air's share of the exchange is now in the books, which is what an
+exact conservation audit of a pair could never have said was missing.
+
 ## The domain whose answers are distributions
 
 Every domain but one is checked against a value: a Fresnel coefficient, a mode frequency, a

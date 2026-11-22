@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/YounghyeonPark/pantometry
 - 快照日期: 2026-11-22
-- 快照 commit: [`2a0681efd96c`](https://github.com/YounghyeonPark/pantometry/commit/2a0681efd96c0c313ad4bf5c026eb800f37915e4)
+- 快照 commit: [`33cea28516bd`](https://github.com/YounghyeonPark/pantometry/commit/33cea28516bd29a000d73ea6ad75ef6e29d85969)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (474 个文件, 12.4 MB)
+## 保留 (476 个文件, 12.5 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 395 | 10.6 MB |
+| 源码 | 397 | 10.7 MB |
 | 文档 | 17 | 1.3 MB |
 | README | 20 | 255.4 KB |
 | 构建/配置 | 42 | 224.3 KB |
 
-按后缀: `.rs` 383 (10.5 MB)、`.md` 37 (1.5 MB)、`Cargo.lock` 4 (144.0 KB)、`.py` 5 (66.2 KB)、`.yml` 6 (41.8 KB)、`Cargo.toml` 29 (29.7 KB)、`.js` 2 (23.5 KB)、`.mjs` 1 (21.6 KB)、`.html` 1 (21.0 KB)、`.sh` 2 (19.9 KB)、`.ps1` 1 (12.8 KB)、`.toml` 2 (8.1 KB)、`pyproject.toml` 1 (594 B)
+按后缀: `.rs` 385 (10.5 MB)、`.md` 37 (1.6 MB)、`Cargo.lock` 4 (144.0 KB)、`.py` 5 (66.2 KB)、`.yml` 6 (41.8 KB)、`Cargo.toml` 29 (29.7 KB)、`.js` 2 (23.5 KB)、`.mjs` 1 (21.6 KB)、`.html` 1 (21.0 KB)、`.sh` 2 (19.9 KB)、`.ps1` 1 (12.8 KB)、`.toml` 2 (8.1 KB)、`pyproject.toml` 1 (594 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

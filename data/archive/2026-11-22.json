@@ -5,9 +5,9 @@
     "one_liner": "该仓库发布ESMC蛋白语言模型、ESMFold2结构预测模型及ESM Atlas，提供可运行的代码、权重和教程，核心聚焦蛋白质结构预测、设计与互作建模，与课题高度契合。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -17,9 +17,9 @@
     "one_liner": "Foundry 是 RosettaCommons 推出的蛋白质设计工具包，集成了 RFD3 结构生成、ProteinMPNN 序列设计和 RF3 结构预测等核心 AI 模型，直接命中蛋白质结构计算与设计课题。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
-      "codewiki": "ok",
-      "zread": "ok"
+      "deepwiki": "reused",
+      "codewiki": "reused",
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -29,9 +29,9 @@
     "one_liner": "Rosetta是蛋白质结构计算建模的经典软件套件，涵盖结构预测、设计、对接和模拟，与课题高度契合。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -43,7 +43,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -53,9 +53,9 @@
     "one_liner": "OpenFold 是 AlphaFold2 的可训练 PyTorch 复现，提供蛋白质结构预测的完整代码、模型与训练流程，是蛋白质结构计算与 AI 方法的核心工具。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
-      "codewiki": "ok",
-      "zread": "ok"
+      "deepwiki": "reused",
+      "codewiki": "reused",
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -65,9 +65,9 @@
     "one_liner": "Chai-1 是一个多模态基础模型，用于蛋白质、小分子、DNA/RNA 等分子结构预测，提供可运行的代码和权重，与蛋白质结构计算方向高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -79,7 +79,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -89,9 +89,9 @@
     "one_liner": "IgFold 是基于深度学习的抗体结构预测工具，提供可运行的代码和预训练模型，直接命中蛋白质结构预测核心课题。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -101,9 +101,9 @@
     "one_liner": "HADDOCK3 是蛋白质-蛋白质对接的模块化计算平台，整合实验数据与生物物理信息进行结构建模，与课题高度相关且提供可运行代码。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -115,7 +115,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -127,7 +127,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -139,7 +139,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -151,7 +151,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -163,7 +163,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -175,7 +175,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -187,7 +187,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -199,7 +199,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -211,7 +211,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -223,7 +223,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -235,7 +235,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -247,7 +247,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -259,7 +259,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -271,7 +271,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -283,7 +283,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -295,7 +295,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -307,7 +307,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -319,7 +319,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -331,7 +331,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -343,7 +343,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -355,7 +355,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -367,7 +367,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -379,7 +379,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -391,7 +391,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -401,9 +401,9 @@
     "one_liner": "OpenMM 是一个高性能分子动力学模拟库，为蛋白质结构计算模拟提供核心物理方法支持，与课题高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -413,9 +413,9 @@
     "one_liner": "PLUMED 是一个用于增强采样分子动力学模拟的开源插件库，核心支持蛋白质等生物分子的构象采样与自由能计算，与蛋白质结构计算方向高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -425,9 +425,9 @@
     "one_liner": "NVIDIA BioNeMo Agent Toolkit 将蛋白质结构预测、对接、设计等生命科学工具封装为 AI Agent 技能，核心覆盖蛋白质结构计算建模，方法上提供可运行的 NIM 服务与工作流，与课题高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -437,9 +437,9 @@
     "one_liner": "Molly.jl 是一个纯 Julia 的分子动力学模拟包，支持蛋白质体系模拟、力场读取、GPU 加速和可微模拟，与蛋白质结构计算方向高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -449,9 +449,9 @@
     "one_liner": "AtomWorks 是 RosettaCommons 开发的生物分子建模开源平台，提供结构解析/清洗工具和深度学习特征化库，直接支持蛋白质结构相关的计算建模与ML流程。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -461,9 +461,9 @@
     "one_liner": "OpenMMTools 是面向 OpenMM 的分子模拟工具包，提供增强采样、自由能计算和 MCMC 框架，直接支持蛋白质结构的物理模拟计算。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -473,9 +473,9 @@
     "one_liner": "Colvars 是一个用于分子模拟的集体变量库，支持增强采样和自由能计算，是蛋白质构象采样和 MD 模拟的重要工具。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -487,7 +487,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -499,7 +499,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -509,9 +509,9 @@
     "one_liner": "FastMDXplora 是一个从 PDB 代码一键完成分子动力学模拟、分析与报告的全流程自动化工具，核心聚焦蛋白质结构及其配体/膜环境的 MD 计算，方法上提供可运行的 CLI/GUI/API 与 Agent 接口，但更偏工程化封装而非方法创新。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -523,7 +523,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -533,9 +533,9 @@
     "one_liner": "CALVADOS 是一个基于 OpenMM 的粗粒化隐式溶剂模拟工具，专注于无序蛋白和多结构域蛋白的结构与相分离行为，属于蛋白质结构相关的物理模拟方法。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -545,9 +545,9 @@
     "one_liner": "Reseek 是一个蛋白质结构搜索与比对算法，通过将蛋白质骨架编码为大规模字母表进行序列比对，显著提升同源检测灵敏度，属于蛋白质结构计算领域的高价值工具。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -557,9 +557,9 @@
     "one_liner": "NVIDIA 的 BioNeMo Inference Runtime 是面向蛋白质、核酸和配体结构预测的 GPU 加速推理库，提供从 FASTA/MSA 到 PDB/mmCIF 的高效结构预测管线，与蛋白质结构计算课题高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -571,7 +571,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -581,9 +581,9 @@
     "one_liner": "OMTRA 是一个基于流匹配的多任务生成模型，用于基于结构的药物设计，涵盖蛋白口袋条件下的配体生成、对接和药效团条件生成，核心涉及蛋白质-配体结构建模，与蛋白质结构计算方向高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -595,7 +595,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -607,7 +607,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -617,9 +617,9 @@
     "one_liner": "PACKMAN 是一个蛋白质结构、堆积与运动分析工具包，实现铰链预测、ANM/hdANM、GNM、堆积熵和动态社区识别等结构计算方法，与蛋白质结构计算建模课题高度相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -629,9 +629,9 @@
     "one_liner": "DIMOS 是一个基于 PyTorch 的可微分子动力学/蒙特卡洛模拟框架，支持经典力场与机器学习势能，可应用于蛋白质结构相关的 MD 模拟与增强采样。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -643,7 +643,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -655,7 +655,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -667,7 +667,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -679,7 +679,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -689,9 +689,9 @@
     "one_liner": "TorchANI-Amber 将 ANI 类神经网络势能集成到 Amber MD 引擎中，实现蛋白质等生物分子的 AI 力场分子动力学模拟，是蛋白质结构计算模拟方向的高价值工具。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -703,7 +703,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -715,7 +715,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -727,7 +727,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -739,7 +739,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -751,7 +751,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -763,7 +763,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -775,7 +775,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -787,7 +787,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -799,7 +799,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -811,7 +811,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -823,7 +823,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -835,7 +835,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -847,7 +847,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -859,7 +859,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -871,7 +871,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -883,7 +883,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -895,7 +895,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -907,7 +907,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -919,7 +919,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -931,7 +931,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -943,7 +943,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -955,7 +955,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -967,7 +967,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -979,7 +979,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -991,7 +991,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1003,7 +1003,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1015,7 +1015,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1027,7 +1027,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1039,7 +1039,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1051,7 +1051,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1063,7 +1063,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1075,7 +1075,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1087,7 +1087,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1099,7 +1099,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1111,7 +1111,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1123,7 +1123,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1135,7 +1135,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1147,7 +1147,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1159,7 +1159,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1171,7 +1171,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1183,7 +1183,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1195,7 +1195,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1207,7 +1207,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1219,7 +1219,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1231,7 +1231,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1243,7 +1243,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1255,7 +1255,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1267,7 +1267,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1279,7 +1279,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1291,7 +1291,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1303,7 +1303,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1315,7 +1315,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1327,7 +1327,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1339,7 +1339,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1351,7 +1351,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1363,7 +1363,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1375,7 +1375,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1387,7 +1387,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1399,7 +1399,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1411,7 +1411,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1423,7 +1423,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1435,7 +1435,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1447,7 +1447,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1459,7 +1459,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1471,7 +1471,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1483,7 +1483,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1495,7 +1495,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1507,7 +1507,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1519,7 +1519,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1531,7 +1531,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1543,7 +1543,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1555,7 +1555,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1565,9 +1565,9 @@
     "one_liner": "Foldseek 是蛋白质结构快速比对与搜索工具，核心对象为蛋白质结构，但主要解决结构比较而非预测/生成/模拟问题，方法上提供可运行的CPU/GPU工具，与课题方向部分相关。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1577,9 +1577,9 @@
     "one_liner": "NVIDIA 的 cuEquivariance 提供等变神经网络的高性能 CUDA 内核与 PyTorch/JAX 绑定，虽非直接针对蛋白质结构，但其等变张量积和分段多项式方法可高效支持蛋白质结构预测与构象建模中的几何神经网络。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1589,9 +1589,9 @@
     "one_liner": "openfe 是一个用于执行炼金术自由能计算的 Python 包，属于分子模拟和药物发现领域，与蛋白质结构计算相关，但主要聚焦于配体结合自由能而非蛋白质结构本身。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1601,9 +1601,9 @@
     "one_liner": "SO3LR 是一个预训练的机器学习力场，用于生物分子模拟，支持分子动力学和几何优化，与蛋白质结构计算相关但非直接针对蛋白质结构预测或设计。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1615,7 +1615,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1625,9 +1625,9 @@
     "one_liner": "BioSimSpace 是一个用于生物分子模拟的 Python 框架，支持分子动力学等物理模拟，与蛋白质结构计算相关，但更偏向于通用模拟工作流而非特定蛋白质结构预测或设计方法。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1639,7 +1639,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1649,9 +1649,9 @@
     "one_liner": "Martinize2/vermouth 是用于将原子结构转换为 Martini 粗粒化拓扑的工具，属于蛋白质结构相关的分子动力学模拟前处理，但非 AI 方法。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -1661,9 +1661,9 @@
     "one_liner": "MDANCE 是一个用于分子动力学轨迹聚类的工具库，通过 n-ary 相似性实现线性时间聚类，帮助分析蛋白质构象采样数据，虽不直接做结构预测或生成，但为 MD 模拟的构象分析提供了高效可用的计算方法。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1675,7 +1675,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1687,7 +1687,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1699,7 +1699,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1711,7 +1711,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1723,7 +1723,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1735,7 +1735,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1747,7 +1747,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1759,7 +1759,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1771,7 +1771,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1783,7 +1783,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1795,7 +1795,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1807,7 +1807,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1819,7 +1819,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1831,7 +1831,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1843,7 +1843,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1855,7 +1855,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1867,7 +1867,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1879,7 +1879,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1891,7 +1891,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1903,7 +1903,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1915,7 +1915,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1927,7 +1927,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1939,7 +1939,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1951,7 +1951,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1963,7 +1963,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1975,7 +1975,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1987,7 +1987,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -1999,7 +1999,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2011,7 +2011,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2023,7 +2023,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2035,7 +2035,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2047,7 +2047,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2059,7 +2059,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2071,7 +2071,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2083,7 +2083,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2095,7 +2095,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2107,7 +2107,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2119,7 +2119,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2131,7 +2131,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2143,7 +2143,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2155,7 +2155,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2167,7 +2167,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2179,7 +2179,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2191,7 +2191,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2203,7 +2203,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2215,7 +2215,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2227,7 +2227,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2239,7 +2239,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2251,7 +2251,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2263,7 +2263,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2275,7 +2275,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2287,7 +2287,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2299,7 +2299,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2311,7 +2311,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2323,7 +2323,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2335,7 +2335,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2347,7 +2347,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2359,7 +2359,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2371,7 +2371,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2383,7 +2383,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2395,7 +2395,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2407,7 +2407,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2419,7 +2419,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2431,7 +2431,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2443,7 +2443,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2455,7 +2455,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2467,7 +2467,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2479,7 +2479,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2491,7 +2491,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2503,7 +2503,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2515,7 +2515,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2527,7 +2527,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2539,7 +2539,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2551,7 +2551,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2563,7 +2563,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2575,7 +2575,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2587,7 +2587,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2599,7 +2599,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2611,7 +2611,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2623,7 +2623,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2635,7 +2635,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2647,7 +2647,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2657,9 +2657,9 @@
     "one_liner": "GPUMD 是一个 GPU 加速的通用分子动力学软件包，支持神经演化势（NEP）训练与模拟，虽非直接针对蛋白质结构，但其 MD 与机器学习势方法可迁移至蛋白质体系。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2671,7 +2671,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2681,9 +2681,9 @@
     "one_liner": "TorchANI 2 是用于训练和使用 ANI 风格神经网络原子间势（NN-IP）的库，可计算分子能量和力并支持 MD 模拟，虽非直接针对蛋白质结构，但其势函数方法可迁移至蛋白质体系。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2693,9 +2693,9 @@
     "one_liner": "TorchSim 是一个基于 PyTorch 的原子级模拟引擎，支持 MLIP 和经典势的 MD 模拟与结构弛豫，虽非蛋白质专用，但其 GPU 加速的 MD 框架可迁移至蛋白质体系。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
-      "codewiki": "ok",
-      "zread": "ok"
+      "deepwiki": "reused",
+      "codewiki": "reused",
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2707,7 +2707,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2717,9 +2717,9 @@
     "one_liner": "OpenFF Toolkit 是分子力学力场开发与应用的 Python 工具包，支持 SMIRNOFF 力场和化学环境感知，虽非直接针对蛋白质结构预测或采样，但为蛋白质 MD 模拟提供力场参数化基础，与课题相关但非核心。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2729,9 +2729,9 @@
     "one_liner": "Packmol 是用于构建分子动力学模拟初始构象的打包工具，虽非直接针对蛋白质结构预测或设计，但其构象生成方法可迁移至蛋白质体系建模。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2743,7 +2743,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2755,7 +2755,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2765,9 +2765,9 @@
     "one_liner": "CPPTRAJ 是分子动力学轨迹分析工具，虽不直接做结构预测或生成，但为蛋白质结构计算中的 MD 模拟提供关键分析支持，属于工程化工具而非方法创新。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2779,7 +2779,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2791,7 +2791,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2801,9 +2801,9 @@
     "one_liner": "metatrain 是一个用于训练和评估原子级机器学习势能的 CLI 工具，支持多种架构并可与 MD 引擎对接，虽非直接针对蛋白质结构，但其原子级建模方法可迁移至蛋白质体系。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2815,7 +2815,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2827,7 +2827,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2839,7 +2839,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2851,7 +2851,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2863,7 +2863,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2873,9 +2873,9 @@
     "one_liner": "CSUBST 是一个分析系统发育树上密码子序列组合替换（趋同氨基酸替换）的工具，可映射到蛋白质结构，但核心是进化序列分析而非蛋白质结构计算建模。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2887,7 +2887,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2899,7 +2899,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -2911,7 +2911,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2923,7 +2923,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2935,7 +2935,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2947,7 +2947,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2959,7 +2959,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2971,7 +2971,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2983,7 +2983,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -2993,9 +2993,9 @@
     "one_liner": "该仓库是分子动力学模拟数据的标准化、验证与分析工作流，面向蛋白质等生物大分子结构，但主要侧重数据整理与QA，而非结构预测或采样方法本身。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
-      "codewiki": "ok",
-      "zread": "submitted"
+      "deepwiki": "reused",
+      "codewiki": "reused",
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3007,7 +3007,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "submitted"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3019,7 +3019,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3031,7 +3031,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3043,7 +3043,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3055,7 +3055,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3067,7 +3067,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3079,7 +3079,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3091,7 +3091,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3103,7 +3103,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3115,7 +3115,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3127,7 +3127,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3139,7 +3139,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3151,7 +3151,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3163,7 +3163,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3175,7 +3175,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3187,7 +3187,7 @@
     "wikis": {
       "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3199,7 +3199,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3211,7 +3211,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3223,7 +3223,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3235,7 +3235,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3247,7 +3247,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3259,7 +3259,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3271,7 +3271,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3283,7 +3283,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3295,7 +3295,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3307,7 +3307,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3319,7 +3319,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3331,7 +3331,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3343,7 +3343,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3355,7 +3355,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3367,7 +3367,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3379,7 +3379,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3391,7 +3391,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3403,7 +3403,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3415,7 +3415,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3427,7 +3427,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3439,7 +3439,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3451,7 +3451,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3463,7 +3463,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3475,7 +3475,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3487,7 +3487,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3499,7 +3499,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3511,7 +3511,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3523,7 +3523,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3535,7 +3535,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3547,7 +3547,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3559,7 +3559,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3571,7 +3571,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3583,7 +3583,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3595,7 +3595,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3607,7 +3607,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3619,7 +3619,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3631,7 +3631,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3643,7 +3643,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3655,7 +3655,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3667,7 +3667,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3679,7 +3679,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3691,7 +3691,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3703,7 +3703,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3715,7 +3715,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3727,7 +3727,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3739,7 +3739,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3751,7 +3751,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3763,7 +3763,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3775,7 +3775,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3787,7 +3787,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3799,7 +3799,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3811,7 +3811,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3823,7 +3823,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3835,7 +3835,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3847,7 +3847,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3859,7 +3859,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3871,7 +3871,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3883,7 +3883,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3895,7 +3895,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3907,7 +3907,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3919,7 +3919,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3931,7 +3931,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3943,7 +3943,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3955,7 +3955,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3967,7 +3967,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3979,7 +3979,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -3991,7 +3991,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4003,7 +4003,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4015,7 +4015,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4027,7 +4027,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4039,7 +4039,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4051,7 +4051,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4063,7 +4063,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4075,7 +4075,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4087,7 +4087,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4099,7 +4099,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4111,7 +4111,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4123,7 +4123,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4135,7 +4135,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4147,7 +4147,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4159,7 +4159,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4171,7 +4171,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4183,7 +4183,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4195,7 +4195,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4207,7 +4207,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4219,7 +4219,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4231,7 +4231,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4243,7 +4243,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4255,7 +4255,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4267,7 +4267,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4279,7 +4279,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4291,7 +4291,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4303,7 +4303,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4315,7 +4315,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4327,7 +4327,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4339,7 +4339,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4351,7 +4351,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4363,7 +4363,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4375,7 +4375,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4387,7 +4387,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4399,7 +4399,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4411,7 +4411,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4423,7 +4423,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4435,7 +4435,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4447,7 +4447,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4459,7 +4459,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4471,7 +4471,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4483,7 +4483,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4495,7 +4495,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4507,7 +4507,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4519,7 +4519,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4531,7 +4531,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4543,7 +4543,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4553,9 +4553,9 @@
     "one_liner": "GEMMI 是用于处理大分子晶体学数据（如 mmCIF、PDB、密度图）的 C++ 库和工具集，虽涉及蛋白质结构文件解析和操作，但核心是数据格式处理而非结构预测、采样或 AI/物理模拟方法，与课题方向部分相关但方法轴较弱。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "ok"
+      "zread": "reused"
     },
     "copy": "code"
   },
@@ -4565,9 +4565,9 @@
     "one_liner": "VIAMD 是分子动力学轨迹的可视化交互分析工具，虽涉及蛋白质结构相关MD分析，但主要贡献在可视化与交互，而非结构预测、采样或生成等核心计算建模方法。",
     "copy_ok": true,
     "wikis": {
-      "deepwiki": "ok",
+      "deepwiki": "reused",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4579,7 +4579,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4591,7 +4591,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4603,7 +4603,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4615,7 +4615,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4627,7 +4627,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4639,7 +4639,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4651,7 +4651,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4663,7 +4663,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4675,7 +4675,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4687,7 +4687,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4699,7 +4699,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4711,7 +4711,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4723,7 +4723,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4735,7 +4735,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4747,7 +4747,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4759,7 +4759,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4771,7 +4771,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4783,7 +4783,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4795,7 +4795,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4807,7 +4807,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4819,7 +4819,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4831,7 +4831,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4843,7 +4843,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4855,7 +4855,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4867,7 +4867,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4879,7 +4879,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4891,7 +4891,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4903,7 +4903,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4915,7 +4915,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4927,7 +4927,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4939,7 +4939,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4951,7 +4951,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   },
@@ -4963,7 +4963,7 @@
     "wikis": {
       "deepwiki": "not_indexed",
       "codewiki": "not_indexed",
-      "zread": "not_indexed"
+      "zread": "failed"
     },
     "copy": "code"
   }

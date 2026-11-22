@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/jimburtoft/boltz-neuron
 - 快照日期: 2026-11-22
-- 快照 commit: [`5b7a1a04bdad`](https://github.com/jimburtoft/boltz-neuron/commit/5b7a1a04bdad0b44d7c6e9675042e28ea2bd44ee)
+- 快照 commit: [`95bfef117bd6`](https://github.com/jimburtoft/boltz-neuron/commit/95bfef117bd6a0257f591aeff3b8d67a66000a82)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (38 个文件, 503.5 KB)
+## 保留 (38 个文件, 503.0 KB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 26 | 461.7 KB |
-| README | 1 | 28.5 KB |
+| 源码 | 26 | 460.9 KB |
+| README | 1 | 28.9 KB |
 | 构建/配置 | 9 | 7.5 KB |
 | 文档 | 2 | 5.7 KB |
 
-按后缀: `.py` 21 (449.0 KB)、`.md` 2 (33.1 KB)、`.sh` 5 (12.7 KB)、`.yaml` 9 (7.5 KB)、`无后缀` 1 (1.0 KB)
+按后缀: `.py` 21 (448.2 KB)、`.md` 2 (33.6 KB)、`.sh` 5 (12.7 KB)、`.yaml` 9 (7.5 KB)、`无后缀` 1 (1.0 KB)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

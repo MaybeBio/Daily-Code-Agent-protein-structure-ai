@@ -48,11 +48,16 @@ from src.capability.general_plm.registry import GENERAL_PLM_REGISTRY
 
 SCHEMA = "general_plm_aggregated_summary_v2"
 
-DEFAULT_SCAN_DIRS: tuple[str, ...] = (
-    "results/shared/external_baseline/20261120133411_4956b7c48429",
-    "results/shared/external_baseline/20261120213246_766da841c1a8",
-    "results/extensions/general_plm_20261120",
-)
+def _default_scan_dirs(root: Path) -> list[Path]:
+    """Auto-discover all ``results/shared/external_baseline/2026112*`` campaigns + local extension dir."""
+    ext_base = root / "results/shared/external_baseline"
+    discovered = (
+        sorted(p for p in ext_base.glob("2026112*") if p.is_dir())
+        if ext_base.is_dir()
+        else []
+    )
+    discovered.append(root / "results/extensions/general_plm_20261120")
+    return discovered
 
 
 def _load_frozen_33_arm_reference(root: Path) -> dict[str, Any]:
@@ -234,11 +239,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    scan_dirs = (
-        list(args.results_dir)
-        if args.results_dir
-        else [DATA_ROOT / rel for rel in DEFAULT_SCAN_DIRS]
-    )
+    scan_dirs = list(args.results_dir) if args.results_dir else _default_scan_dirs(DATA_ROOT)
 
     args.out.mkdir(parents=True, exist_ok=True)
     arms_summary: dict[str, dict[str, Any]] = {}
@@ -308,11 +309,17 @@ def main() -> None:
                     "schema": schema,
                 }
                 continue
-            if isinstance(schema, str) and schema == "r5_structure_evaluation_v1":
-                companion_artifacts[f"r5_structure_eval::{path.stem}"] = {
+            if isinstance(schema, str) and schema in (
+                "general_plm_r5_structure_eval_v1",
+                "r5_structure_evaluation_v1",
+            ):
+                inst = doc.get("esmfold2_instrument") or {}
+                companion_artifacts[f"r5_structure_eval::{path.parent.name}"] = {
                     "source": rel_src,
                     "schema": schema,
-                    "n_sequences_folded": doc.get("n_sequences_folded"),
+                    "label": doc.get("label") or path.parent.name,
+                    "n_unique_folded": inst.get("n_unique_folded") or doc.get("n_sequences_folded"),
+                    "n_records_total": doc.get("n_records_total"),
                 }
                 continue
 
@@ -371,7 +378,15 @@ def main() -> None:
                     "bands": doc.get("bands"),
                 }
             elif schema == "general_plm_r5_infill_and_diffusion_gen_v1":
-                entry["modules"]["r5_infill_and_gen"] = {
+                d_mode = (doc.get("denovo_summary") or {}).get("diffusion_sampling_mode") or (
+                    doc.get("ladder_summary") or {}
+                ).get("diffusion_sampling_mode")
+                r5_key = (
+                    f"r5_infill_and_gen_{d_mode}"
+                    if d_mode and d_mode != "max_confidence"
+                    else "r5_infill_and_gen"
+                )
+                entry["modules"][r5_key] = {
                     "source": rel_src,
                     "dtype_realised": doc.get("provenance", {}).get("dtype_realised"),
                     "ladder_summary": doc.get("ladder_summary"),

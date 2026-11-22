@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/Trista1208/protein_design
 - 快照日期: 2026-11-22
-- 快照 commit: [`0d2ceff7247c`](https://github.com/Trista1208/protein_design/commit/0d2ceff7247ce1d3b2361085fb416b7c86f6d274)
+- 快照 commit: [`c8871871ff41`](https://github.com/Trista1208/protein_design/commit/c8871871ff4145809f37eed1fb32fcde31f5dbf2)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (917 个文件, 19.5 MB)
@@ -18,11 +18,11 @@
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 
-## 省略 (1019 个文件, 129.8 MB)
+## 省略 (1024 个文件, 130.0 MB)
 
 | 原因 | 文件数 | 大小 |
 |---|---:|---:|
-| 后缀不在白名单 | 1019 | 129.8 MB |
+| 后缀不在白名单 | 1024 | 130.0 MB |
 
 体积最大的省略文件:
 

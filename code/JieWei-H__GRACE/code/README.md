@@ -1,6 +1,6 @@
 # GRACE: GRaph Autoregressive Complex gEneration
 
-**Version 1.1.0 (2026-11-15)** — adds the revision analyses: node-embedding ablation, seed-conditional held-out evaluation with per-group seeds, and pretraining-corpus versus held-out overlap quantification.
+**Version 1.1.0 (2026-11-15)** — adds the revision analyses: node-embedding ablation, seed-conditional held-out evaluation with per-group seeds, pretraining-corpus versus held-out overlap quantification, and removal of held-out leakage from the pretraining corpus (`03_corpus_construction/Filter_Heldout_Contiguous.py`).
 
 GRACE reformulates protein complex prediction from protein-protein interaction (PPI) networks as a **graph-conditioned autoregressive generation** problem. It fuses ESM-2 sequence semantics with PPI topology via a graph-structure embedding module, and decodes complex-member sequences under functional calibration provided by a topology-aware similarity bias.
 
@@ -16,7 +16,7 @@ The codebase is organized following the Methods sections of the manuscript:
 | --------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `01_data_preparation/`      | Data sources and network construction | Base subgraph generation (`main/`: pipeline version; `legacy/`: early version), train/test splitting, PPI data loading |
 | `02_graph_embedding/`       | Graph-structure embedding             | GAT, attention pooling, contrastive training (`Train-Cosine.py`), tokenizer                                            |
-| `03_corpus_construction/`   | Training corpus construction          | BFS-serialized pretraining and SFT corpus builders (`GraphTransform_BFS_Pretrain.py`, `GraphTransform_BFS_SFT-1.py`)   |
+| `03_corpus_construction/`   | Training corpus construction          | BFS-serialized pretraining and SFT corpus builders (`GraphTransform_BFS_Pretrain.py`, `GraphTransform_BFS_SFT-1.py`), held-out leakage filter (`Filter_Heldout_Contiguous.py`) |
 | `04_pretraining/`           | Autoregressive pre-training           | `Pretrain_Cosine.py`, LM backbone (`ModelLM.py`), dataset loader                                                       |
 | `05_fine_tuning/`           | Supervised fine-tuning                | `SFT_Cosine.py`, `SFT_None.py`                                                                                         |
 | `06_functional_annotation/` | Functional annotation integration     | Label propagation (`Annotation.py`), similarity matrix construction                                                    |
@@ -100,6 +100,12 @@ python 3.Complex_Generate_multi.py
 # 1. Build BFS corpus (03_corpus_construction/)
 python GraphTransform_BFS_Pretrain.py         # -> pretrain corpus
 python GraphTransform_BFS_SFT-1.py            # -> SFT corpus
+
+# 1b. Remove held-out leakage from the pretraining corpus (held-out partition only)
+python Filter_Heldout_Contiguous.py --corpus ../pretrain_combined.json \
+    --heldout ../data/split_7-3/Complex_Test.pkl --token-map ../data/token_id_gene.pkl \
+    --min-subunits 3 --out ../pretrain_combined_filtered.json --report ../filter_report.json
+# -> 18,979,562 sequences scanned, 9,262 dropped (0.0488%), 18,970,300 kept
 
 # 2. Pre-training (04_pretraining/)
 python Pretrain_Cosine.py --epochs 10 --batch_size 64 --accumulation_steps 8 --learning_rate 5e-4 \
@@ -216,10 +222,26 @@ the 6+/low-degree cell.
 Against the 1,152 held-out complexes of the 7:3 partition, 71.5% of the protein-overlap subset
 and 90.7% of the truly-unseen subset are contained as a superset in at least one pretraining BFS
 sequence, while exact-sequence hits occur for only 0.2% and 1.5%. The two corpus fractions are
-reported as a disclosure of what "held out" means at the corpus level, not as a claim that test
-members were excluded.
+reported as a disclosure of what "held out" means at the corpus level: superset containment is
+not removed by the filter, only verbatim reuse is.
+
+The removal itself is implemented in `03_corpus_construction/Filter_Heldout_Contiguous.py`. A
+pretraining sequence is dropped when some window of L adjacent tokens has a token set exactly
+equal to the members of a held-out complex with L >= 3 subunits, i.e. the complex is reproducible
+as one contiguous block. Scanning 18,979,562 sequences of the 7:3 revision corpus flags 9,262
+(0.0488%) and leaves 18,970,300. Two coarser filters act upstream of this one: base subgraphs
+reaching Jaccard >= 0.30 with any held-out complex are discarded together with all their noisy
+copies (1,176 of 25,353), and noise-injected fine-tuning variants are screened at Jaccard >= 0.50
+(7,152 of 497,816).
 
 ```bash
 cd 10_revision_analyses/10.3_corpus_construction_audit/scripts
 python fast_overlap_73.py
+```
+
+```bash
+# sequence-level scan + removal (03_corpus_construction/)
+python Filter_Heldout_Contiguous.py --corpus pretrain_combined_73_20m.json \
+    --heldout split73/Complex_Test.pkl --token-map token_id_gene.pkl \
+    --min-subunits 3 --dry-run          # add --out to write the filtered corpus
 ```

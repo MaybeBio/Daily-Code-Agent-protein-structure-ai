@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/FidanKarimli/graph-jepa-protein-stability
 - 快照日期: 2026-11-22
-- 快照 commit: [`93e6c0eeba2e`](https://github.com/FidanKarimli/graph-jepa-protein-stability/commit/93e6c0eeba2e0c896b75a1cd762a7babc214c2c6)
+- 快照 commit: [`c075fe236959`](https://github.com/FidanKarimli/graph-jepa-protein-stability/commit/c075fe236959597d18c0637ef06558103bc3cba2)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (72 个文件, 562.6 KB)
+## 保留 (71 个文件, 522.9 KB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
 | 源码 | 56 | 463.5 KB |
-| 文档 | 6 | 80.7 KB |
-| README | 2 | 13.8 KB |
+| 文档 | 5 | 40.6 KB |
+| README | 2 | 14.2 KB |
 | 构建/配置 | 8 | 4.7 KB |
 
-按后缀: `.py` 49 (258.7 KB)、`.ipynb` 2 (199.7 KB)、`.md` 8 (94.5 KB)、`.sh` 5 (5.0 KB)、`.yaml` 5 (2.7 KB)、`.txt` 2 (1.4 KB)、`pyproject.toml` 1 (507 B)
+按后缀: `.py` 49 (258.7 KB)、`.ipynb` 2 (199.7 KB)、`.md` 7 (54.8 KB)、`.sh` 5 (5.0 KB)、`.yaml` 5 (2.7 KB)、`.txt` 2 (1.4 KB)、`pyproject.toml` 1 (507 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

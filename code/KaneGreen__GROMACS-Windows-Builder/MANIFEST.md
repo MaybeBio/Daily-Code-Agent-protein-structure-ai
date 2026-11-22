@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/KaneGreen/GROMACS-Windows-Builder
 - 快照日期: 2026-11-22
-- 快照 commit: [`93bc20ad10fe`](https://github.com/KaneGreen/GROMACS-Windows-Builder/commit/93bc20ad10febd074464e97fd8e79bf1513d8f4d)
+- 快照 commit: [`e14697d81db4`](https://github.com/KaneGreen/GROMACS-Windows-Builder/commit/e14697d81db4ee9bd1033090e2822ac5e2b2f4a1)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (9 个文件, 44.0 KB)
+## 保留 (9 个文件, 44.1 KB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
 | 文档 | 2 | 26.1 KB |
 | 源码 | 4 | 8.6 KB |
-| 构建/配置 | 2 | 7.7 KB |
+| 构建/配置 | 2 | 7.8 KB |
 | README | 1 | 1.6 KB |
 
-按后缀: `无后缀` 2 (26.1 KB)、`.yml` 2 (7.7 KB)、`.cmake` 2 (6.2 KB)、`.md` 1 (1.6 KB)、`.h` 1 (1.2 KB)、`.sh` 1 (1.2 KB)
+按后缀: `无后缀` 2 (26.1 KB)、`.yml` 2 (7.8 KB)、`.cmake` 2 (6.2 KB)、`.md` 1 (1.6 KB)、`.h` 1 (1.2 KB)、`.sh` 1 (1.2 KB)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

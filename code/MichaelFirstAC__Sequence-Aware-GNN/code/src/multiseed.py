@@ -11,6 +11,7 @@ Outputs:
   results/wilcoxon_tests.csv     exact p-values
 """
 import os
+import sys
 import itertools
 import numpy as np
 import pandas as pd
@@ -31,10 +32,20 @@ def main():
     seeds = cfg["project"]["seeds"]
     device = get_device(cfg)
     proc, res = cfg["data"]["processed_dir"], cfg["data"]["results_dir"]
-    edges_path = os.path.join(proc, "ppi_edges_uniprot.csv")
+    # Dataset switch: `python src/multiseed.py string` (default: config data.dataset_name)
+    dataset = sys.argv[1] if len(sys.argv) > 1 else cfg["data"].get("dataset_name", "primekg")
+    if dataset == "string":
+        edges_path, prefix = os.path.join(proc, "string_edges_uniprot.csv"), "string_"
+    elif dataset == "primekg":
+        edges_path, prefix = os.path.join(proc, "ppi_edges_uniprot.csv"), ""
+    else:
+        raise ValueError(f"Unknown dataset '{dataset}' (use 'primekg' or 'string')")
+    if not os.path.exists(edges_path):
+        raise FileNotFoundError(f"{edges_path} not found. For STRING run: python src/string_data.py")
+    logger.info(f"Dataset: {dataset} | edges: {edges_path}")
     h, do = cfg["training"]["hidden_dim"], cfg["training"]["dropout"]
 
-    raw_path = os.path.join(res, "multiseed_raw.csv")
+    raw_path = os.path.join(res, f"{prefix}multiseed_raw.csv")
     rows = pd.read_csv(raw_path).to_dict("records") if os.path.exists(raw_path) else []  # resumable
     done = {(r["Seed"], r["Split"], r["Features"]) for r in rows}
 
@@ -53,7 +64,7 @@ def main():
                 tr, va, te = with_features(base, x)
                 set_seed(seed)  # identical init RNG state for every model
                 m = run_experiment(GCNModel(x.size(1), h, do), tr, va, te, cfg, device,
-                                   f"ms_{seed}_{fname}_{split_name}")
+                                   f"ms_{prefix}{seed}_{fname}_{split_name}")
                 m.update(Seed=seed, Split=split_name, Features=fname, Model="GCN")
                 rows.append(m)
                 pd.DataFrame(rows).to_csv(raw_path, index=False)
@@ -61,7 +72,7 @@ def main():
             if (seed, split_name, "Classical Sequence") not in done:
                 tr, va, te = with_features(base, feats["Classical + Structure"])
                 rf = RandomForestClassifier(n_estimators=50, max_depth=12, random_state=seed, n_jobs=-1)
-                m = run_sklearn_experiment(rf, tr, te, f"ms_RF_{seed}_{split_name}")
+                m = run_sklearn_experiment(rf, tr, te, f"ms_RF_{prefix}{seed}_{split_name}")
                 m.update(Seed=seed, Split=split_name, Features="Classical Sequence", Model="RandomForest")
                 rows.append(m)
                 pd.DataFrame(rows).to_csv(raw_path, index=False)
@@ -76,7 +87,7 @@ def main():
             r[f"{c}_mean"], r[f"{c}_std"] = d[c].mean(), d[c].std(ddof=1)
             r[c] = f"{d[c].mean():.4f} ± {d[c].std(ddof=1):.4f}"
         out.append(r)
-    pd.DataFrame(out).to_csv(os.path.join(res, "multiseed_metrics.csv"), index=False)
+    pd.DataFrame(out).to_csv(os.path.join(res, f"{prefix}multiseed_metrics.csv"), index=False)
 
     # Paired Wilcoxon on test AUC (pairs matched by seed)
     tests = []
@@ -93,7 +104,7 @@ def main():
                           "mean_AUC_diff(B-A)": d.mean(), "B_wins": int((d > 0).sum()),
                           "W": two.statistic, "p_two_sided": two.pvalue, "p_one_sided(B>A)": one.pvalue})
     t = pd.DataFrame(tests)
-    t.to_csv(os.path.join(res, "wilcoxon_tests.csv"), index=False)
+    t.to_csv(os.path.join(res, f"{prefix}wilcoxon_tests.csv"), index=False)
     print(pd.DataFrame(out)[["Model", "Features", "Split", "AUC"]].to_string(index=False))
     print(t.to_string(index=False))
     n = len(seeds)

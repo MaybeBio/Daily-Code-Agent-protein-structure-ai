@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/Leo-T-Zang/Leo-T-Zang
 - 快照日期: 2026-11-22
-- 快照 commit: [`e3b319ca5860`](https://github.com/Leo-T-Zang/Leo-T-Zang/commit/e3b319ca5860cfbfac6e7273fdd3c7e9204d9a20)
+- 快照 commit: [`1f693d99e5df`](https://github.com/Leo-T-Zang/Leo-T-Zang/commit/1f693d99e5df7734226e630bdde2b347187626a1)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (4 个文件, 12.4 KB)

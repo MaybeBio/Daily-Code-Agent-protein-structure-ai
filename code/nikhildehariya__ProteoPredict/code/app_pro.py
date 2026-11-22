@@ -116,61 +116,395 @@ def check_motifs(sequence: str):
     return pd.DataFrame(found_motifs) if found_motifs else None
 
 
-# --- Scientific HTML Report Generator ---
-def generate_report_html(sequence, source_id, df_results, applied_threshold):
-    input_sequence_text = sequence.strip().upper()
-    df_report = df_results[["GO_ID", "Category", "Predicted_Function", "Description", "Confidence (%)"]]
-    results_table = df_report.to_html(index=False, classes="report-table", justify="left")
-    thresh_display = f"{applied_threshold:.4f} ({applied_threshold * 100:.1f}%)" if applied_threshold is not None else "Calibrated (MF=0.406, BP=0.369, CC=0.345)"
-
-    report_html = f"""
-    <html>
-    <head>
-        <title>ProteoPredict Scientific Annotation Report</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 40px; color: #222; }}
-            h1 {{ color: #0d47a1; border-bottom: 3px solid #0d47a1; padding-bottom: 10px; font-size: 26px; }}
-            h2 {{ color: #333; border-bottom: 1px solid #ddd; margin-top: 25px; padding-bottom: 5px; font-size: 18px; }}
-            .param-table {{ width: 60%; margin-bottom: 20px; border-collapse: collapse; }}
-            .param-table td {{ padding: 8px; border: 1px solid #eee; font-size: 13px; }}
-            .param-table td:first-child {{ font-weight: bold; width: 45%; background-color: #f8f9fa; }}
-            .sequence-box {{ background-color: #f4f6f8; padding: 12px; border-radius: 4px; font-family: 'Courier New', monospace; white-space: pre-wrap; word-break: break-all; font-size: 11px; }}
-            .report-table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-            .report-table th, .report-table td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 12px; }}
-            .report-table th {{ background-color: #f1f3f5; font-weight: 600; }}
-            .footer {{ margin-top: 40px; font-size: 11px; color: #666; border-top: 1px solid #eee; padding-top: 10px; }}
-        </style>
-    </head>
-    <body>
-        <h1>ProteoPredict Scientific Annotation Report</h1>
-        <p><strong>Generated:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
-        
-        <h2>1. Analysis Parameters & Model Benchmark</h2>
-        <table class="param-table">
-            <tr><td>Protein Identifier / Query</td><td>{source_id}</td></tr>
-            <tr><td>Sequence Length</td><td>{len(input_sequence_text)} Amino Acids</td></tr>
-            <tr><td>Architecture</td><td>Tri-Modal Multi-Branch Deep Network (EXP-007)</td></tr>
-            <tr><td>PLM Backbone</td><td>Meta AI ESM-2 (8M parameters, 320D)</td></tr>
-            <tr><td>Decision Threshold</td><td>{thresh_display}</td></tr>
-            <tr><td>Benchmark Test Micro-F1 (CAFA)</td><td>{REPORTED_F1:.4f}</td></tr>
-            <tr><td>Benchmark Molecular Function F1</td><td>{REPORTED_MF:.4f}</td></tr>
-            <tr><td>Benchmark Test Precision / Recall</td><td>{REPORTED_PRECISION:.4f} / {REPORTED_RECALL:.4f}</td></tr>
-        </table>
-
-        <h2>Input Sequence (First 120 Residues)</h2>
-        <div class="sequence-box">{input_sequence_text[:120]}...</div>
-
-        <h2>2. Predicted Gene Ontology Annotations</h2>
-        <p>Predictions evaluated under calibrated thresholds on human Swiss-Prot vocabulary:</p>
-        {results_table}
-
-        <div class="footer">
-            <p>ProteoPredict - Verified Computational Biology Platform. Zero synthetic data, homology-clustered training.</p>
-        </div>
-    </body>
-    </html>
+# --- Scientific PDF Report Generator ---
+def generate_report_pdf(sequence, source_id, df_results, applied_threshold, motifs_df=None, aa_df=None):
     """
-    return report_html
+    Generates a professional-grade, publication-quality PDF report using ReportLab.
+    Format modelled on NCBI/EBI-style computational biology tool outputs.
+    Running header + footer on every page. Page numbers. Full-width tables.
+    """
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.platypus import (
+        BaseDocTemplate, Frame, PageTemplate, NextPageTemplate,
+        Paragraph, Spacer, Table, TableStyle,
+        HRFlowable, PageBreak,
+    )
+
+    PAGE_W, PAGE_H = letter
+    LMARGIN  = 0.75 * inch
+    RMARGIN  = 0.75 * inch
+    BMARGIN  = 0.65 * inch
+    CONTENT_W = PAGE_W - LMARGIN - RMARGIN
+
+    NAVY     = colors.HexColor("#0d2b5e")
+    MIDBLUE  = colors.HexColor("#1565c0")
+    LTBLUE   = colors.HexColor("#e8f0fb")
+    LTGRAY   = colors.HexColor("#f5f6f8")
+    MEDGRAY  = colors.HexColor("#c8cdd6")
+    DARKGRAY = colors.HexColor("#4a4a4a")
+    BLACK    = colors.HexColor("#1a1a1a")
+    WHITE    = colors.white
+    ACCENT   = colors.HexColor("#1976d2")
+
+    styles = getSampleStyleSheet()
+
+    sty_section = ParagraphStyle(
+        "SH", fontName="Helvetica-Bold", fontSize=9.5, leading=13,
+        textColor=NAVY, spaceBefore=12, spaceAfter=0,
+    )
+    sty_body = ParagraphStyle(
+        "BD", fontName="Helvetica", fontSize=8, leading=11.5, textColor=BLACK,
+    )
+    sty_body_sm = ParagraphStyle(
+        "BDsm", fontName="Helvetica", fontSize=7.5, leading=11, textColor=DARKGRAY,
+    )
+    sty_mono = ParagraphStyle(
+        "MN", fontName="Courier", fontSize=7, leading=10,
+        textColor=DARKGRAY, backColor=LTGRAY,
+        leftIndent=8, rightIndent=8, spaceBefore=2, spaceAfter=2,
+    )
+    sty_disclaimer = ParagraphStyle(
+        "DS", fontName="Helvetica-Oblique", fontSize=7, leading=10, textColor=DARKGRAY,
+    )
+    sty_cat_head = ParagraphStyle(
+        "CH", fontName="Helvetica-Bold", fontSize=8.5, leading=12,
+        textColor=MIDBLUE, spaceBefore=10, spaceAfter=2,
+    )
+
+    input_seq = sequence.strip().upper()
+    now_str   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    report_id = f"PP-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+    if applied_threshold is not None:
+        thresh_mf = thresh_bp = thresh_cc = \
+            f"{applied_threshold:.4f}  ({applied_threshold * 100:.1f}%)"
+        thresh_mode = "Global (user-defined override)"
+    else:
+        thresh_mf, thresh_bp, thresh_cc = \
+            "0.4060  (40.6%)", "0.3690  (36.9%)", "0.3450  (34.5%)"
+        thresh_mode = "Per-ontology calibrated (F_max optimised per sub-ontology)"
+
+    n_mf = len(df_results[df_results["Category"] == "Molecular Function"])
+    n_bp = len(df_results[df_results["Category"] == "Biological Process"])
+    n_cc = len(df_results[df_results["Category"] == "Cellular Component"])
+
+    # ------------------------------------------------------------------ #
+    #  Page callbacks
+    # ------------------------------------------------------------------ #
+    def _draw_footer(canvas, doc):
+        canvas.setStrokeColor(MEDGRAY)
+        canvas.setLineWidth(0.4)
+        y_line = BMARGIN - 0.10 * inch
+        canvas.line(LMARGIN, y_line, PAGE_W - RMARGIN, y_line)
+        canvas.setFillColor(DARKGRAY)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawString(LMARGIN, y_line - 0.14 * inch,
+                          "ProteoPredict Computational Biology Platform  |  "
+                          "Data: UniProtKB/Swiss-Prot (reviewed)  |  "
+                          "GO Ontology: Gene Ontology Consortium")
+        canvas.drawRightString(PAGE_W - RMARGIN, y_line - 0.14 * inch,
+                               f"Page {doc.page}")
+
+    def _first_page(canvas, doc):
+        canvas.saveState()
+        bh = 0.72 * inch
+        canvas.setFillColor(NAVY)
+        canvas.rect(0, PAGE_H - bh, PAGE_W, bh, fill=1, stroke=0)
+        # accent stripe
+        canvas.setFillColor(ACCENT)
+        canvas.rect(0, PAGE_H - bh - 0.04 * inch, PAGE_W, 0.04 * inch, fill=1, stroke=0)
+        # brand
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 15)
+        canvas.drawString(LMARGIN, PAGE_H - 0.30 * inch, "ProteoPredict")
+        # subtitle
+        canvas.setFont("Helvetica", 9)
+        canvas.setFillColor(colors.HexColor("#b8cce4"))
+        canvas.drawString(LMARGIN + 1.85 * inch, PAGE_H - 0.30 * inch,
+                          "Gene Ontology Functional Annotation Report")
+        # meta right
+        canvas.setFont("Helvetica", 7)
+        canvas.drawRightString(PAGE_W - RMARGIN, PAGE_H - 0.24 * inch,
+                               f"Report ID: {report_id}")
+        canvas.drawRightString(PAGE_W - RMARGIN, PAGE_H - 0.38 * inch,
+                               f"Generated: {now_str}")
+        _draw_footer(canvas, doc)
+        canvas.restoreState()
+
+    def _later_pages(canvas, doc):
+        canvas.saveState()
+        hh = 0.34 * inch
+        canvas.setFillColor(NAVY)
+        canvas.rect(0, PAGE_H - hh, PAGE_W, hh, fill=1, stroke=0)
+        canvas.setFillColor(ACCENT)
+        canvas.rect(0, PAGE_H - hh - 0.03 * inch, PAGE_W, 0.03 * inch, fill=1, stroke=0)
+        canvas.setFillColor(WHITE)
+        canvas.setFont("Helvetica-Bold", 7.5)
+        canvas.drawString(LMARGIN, PAGE_H - hh + 0.11 * inch, "ProteoPredict")
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#b8cce4"))
+        canvas.drawString(LMARGIN + 1.1 * inch, PAGE_H - hh + 0.11 * inch,
+                          f"Gene Ontology Annotation Report  \u2022  {source_id}  \u2022  {report_id}")
+        _draw_footer(canvas, doc)
+        canvas.restoreState()
+
+    # ------------------------------------------------------------------ #
+    #  Document
+    # ------------------------------------------------------------------ #
+    buf = BytesIO()
+    doc = BaseDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=LMARGIN, rightMargin=RMARGIN,
+        topMargin=0.75 * inch, bottomMargin=BMARGIN,
+        title=f"ProteoPredict Report \u2014 {source_id}",
+        author="ProteoPredict Computational Biology Platform",
+        subject="Gene Ontology Functional Annotation",
+    )
+    frame_first = Frame(LMARGIN, BMARGIN, CONTENT_W,
+                        PAGE_H - 0.90 * inch - BMARGIN, id="first")
+    frame_body  = Frame(LMARGIN, BMARGIN, CONTENT_W,
+                        PAGE_H - 0.52 * inch - BMARGIN, id="body")
+    doc.addPageTemplates([
+        PageTemplate(id="First", frames=frame_first, onPage=_first_page),
+        PageTemplate(id="Later", frames=frame_body,  onPage=_later_pages),
+    ])
+
+    # ------------------------------------------------------------------ #
+    #  Helpers
+    # ------------------------------------------------------------------ #
+    def section_header(label):
+        return [
+            Spacer(1, 0.05 * inch),
+            Table(
+                [[Paragraph(f"<b>{label}</b>", sty_section)]],
+                colWidths=[CONTENT_W],
+                style=TableStyle([
+                    ("BACKGROUND",    (0, 0), (-1, -1), LTBLUE),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("LINEBEFORE",    (0, 0), (0, -1),  3, NAVY),
+                ]),
+            ),
+            Spacer(1, 0.04 * inch),
+        ]
+
+    def param_table(rows):
+        cw0 = 2.35 * inch
+        cw1 = CONTENT_W - cw0
+        data = [
+            [Paragraph(f"<b>{r[0]}</b>", sty_body),
+             Paragraph(str(r[1]), sty_body)]
+            for r in rows
+        ]
+        t = Table(data, colWidths=[cw0, cw1])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (0, -1), LTGRAY),
+            ("BACKGROUND",    (1, 0), (1, -1), WHITE),
+            ("GRID",          (0, 0), (-1, -1), 0.3, MEDGRAY),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 7),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ]))
+        return t
+
+    def data_table(headers, rows, col_widths):
+        hrow  = [Paragraph(f"<b>{h}</b>",
+                            ParagraphStyle("TH", fontName="Helvetica-Bold",
+                                           fontSize=7.5, textColor=WHITE))
+                 for h in headers]
+        brows = [[Paragraph(str(c), sty_body_sm) for c in row] for row in rows]
+        t = Table([hrow] + brows, colWidths=col_widths, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",     (0, 0), (-1,  0), NAVY),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LTGRAY]),
+            ("GRID",           (0, 0), (-1, -1), 0.25, MEDGRAY),
+            ("TOPPADDING",     (0, 0), (-1, -1), 3.5),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 3.5),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
+            ("VALIGN",         (0, 0), (-1, -1), "TOP"),
+        ]))
+        return t
+
+    # ================================================================== #
+    #  Story
+    # ================================================================== #
+    story = [NextPageTemplate("Later")]
+
+    # ---- 1. Query Info -----------------------------------------------
+    story += section_header("1.  Query Information")
+    story.append(param_table([
+        ("Protein Identifier", source_id),
+        ("Sequence Length",    f"{len(input_seq):,} amino acids"),
+    ]))
+    story.append(Spacer(1, 0.04 * inch))
+    story.append(Paragraph("<b>Query Sequence</b> (first 240 residues shown, 60 per line):", sty_body))
+    story.append(Spacer(1, 2))
+    for idx in range(0, min(len(input_seq), 240), 60):
+        story.append(Paragraph(
+            f"<font name='Courier'>{idx+1:>5} </font>" + input_seq[idx:idx+60], sty_mono))
+    if len(input_seq) > 240:
+        story.append(Paragraph("        \u2026 (sequence continues beyond display limit)", sty_mono))
+
+    # ---- 2. Model & Architecture ------------------------------------
+    story += section_header("2.  Prediction Model & Architecture")
+    story.append(param_table([
+        ("System",                     "ProteoPredict Tri-Modal Inference Engine (EXP-007)"),
+        ("Neural Architecture",        "Tri-Modal Multi-Branch Deep Fusion Network"),
+        ("Protein Language Model",     "Meta AI ESM-2  |  esm2_t6_8M_UR50D  |  8M parameters  |  320D embeddings"),
+        ("Sequence Feature Module",    "3-mer TF-IDF Vectorizer  |  vocabulary: 1,500 dimensions"),
+        ("Biophysical Feature Module", "Physico-chemical descriptor panel  |  430 dimensions"),
+        ("Total Feature Space",        "2,250D fused tri-modal representation"),
+        ("Training Corpus",            "18,338 manually reviewed UniProtKB/Swiss-Prot proteins"),
+        ("Homology Partitioning",      "CD-HIT clustering at <30% pairwise sequence identity"),
+        ("Data Integrity Policy",      "Zero synthetic entries; all proteins experimentally curated"),
+    ]))
+
+    # ---- 3. Thresholds ----------------------------------------------
+    story += section_header("3.  Calibrated Decision Thresholds")
+    story.append(param_table([
+        ("Threshold Strategy",       thresh_mode),
+        ("Molecular Function (MF)",  thresh_mf),
+        ("Biological Process (BP)",  thresh_bp),
+        ("Cellular Component (CC)",  thresh_cc),
+    ]))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        "Each threshold was independently selected to maximise the micro-averaged F1 score (F_max) "
+        "under the CAFA evaluation protocol on the held-out test partition.",
+        sty_disclaimer))
+
+    # ---- 4. Benchmark Metrics ---------------------------------------
+    story += section_header("4.  Benchmark Performance \u2014 Test Partition")
+    story.append(data_table(
+        ["Metric", "Value", "Metric", "Value"],
+        [
+            ["Micro-F1  (F_max, CAFA)", f"{REPORTED_F1:.4f}",
+             "Macro-F1",                f"{REPORTED_MACRO:.4f}"],
+            ["Molecular Function F1",   f"{REPORTED_MF:.4f}",
+             "Biological Process F1",   f"{REPORTED_BP:.4f}"],
+            ["Cellular Component F1",   f"{REPORTED_CC:.4f}",
+             "Precision (micro)",       f"{REPORTED_PRECISION:.4f}"],
+            ["Recall (micro)",          f"{REPORTED_RECALL:.4f}",
+             "Evaluation Protocol",     "CAFA"],
+        ],
+        [2.1*inch, 1.0*inch, 2.1*inch, 1.0*inch]
+    ))
+
+    # ---- 5. Annotation Summary --------------------------------------
+    story += section_header("5.  Annotation Summary for This Query")
+    story.append(data_table(
+        ["Category", "Terms Predicted", "Decision Threshold"],
+        [
+            ["Molecular Function", str(n_mf), thresh_mf],
+            ["Biological Process", str(n_bp), thresh_bp],
+            ["Cellular Component", str(n_cc), thresh_cc],
+            ["Total",              str(len(df_results)), "\u2014"],
+        ],
+        [2.4*inch, 1.4*inch, CONTENT_W - 2.4*inch - 1.4*inch]
+    ))
+    if len(df_results):
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            f"Highest confidence score in this prediction: "
+            f"<b>{df_results['Confidence_Score'].max():.4f}</b>  "
+            f"({df_results['Confidence_Score'].max()*100:.1f}%)",
+            sty_body))
+
+    # ---- 6. Motif Analysis ------------------------------------------
+    story += section_header("6.  Sequence Motif Analysis")
+    if motifs_df is not None and len(motifs_df) > 0:
+        story.append(Paragraph(
+            f"{len(motifs_df)} consensus functional motif(s) identified by PROSITE-style "
+            "regular-expression scanning of the query sequence.",
+            sty_body))
+        story.append(Spacer(1, 4))
+        story.append(data_table(
+            ["Motif / Consensus Pattern", "Matched Subsequence", "Start", "End"],
+            [[r["Motif"], r["Match Sequence"],
+              str(r["Start Position"]), str(r["End Position"])]
+             for _, r in motifs_df.iterrows()],
+            [3.3*inch, 1.5*inch, 0.65*inch, 0.65*inch]
+        ))
+    else:
+        story.append(Paragraph(
+            "No standard consensus catalytic motifs detected by PROSITE-style pattern scanning. "
+            "Functional activity is not excluded; structural or non-canonical sites may be present "
+            "but are outside the scope of this analysis.",
+            sty_disclaimer))
+
+    # ---- 7. Amino Acid Composition -----------------------------------
+    if aa_df is not None and len(aa_df) > 0:
+        story += section_header("7.  Amino Acid Residue Composition (Top 10)")
+        top10 = aa_df.head(10).reset_index(drop=True)
+        left  = top10.iloc[:5]
+        right = top10.iloc[5:]
+        def aa_mini(sub):
+            return data_table(
+                ["Residue", "Count", "Fraction (%)"],
+                [[r["Amino Acid"], str(r["Count"]), f"{r['Percentage (%)']:.2f}%"]
+                 for _, r in sub.iterrows()],
+                [0.9*inch, 0.75*inch, 1.0*inch]
+            )
+        pair = Table(
+            [[aa_mini(left), Spacer(0.2*inch, 1), aa_mini(right)]],
+            colWidths=[2.65*inch, 0.2*inch, 2.65*inch]
+        )
+        story.append(pair)
+        next_sec = "8"
+    else:
+        next_sec = "7"
+
+    # ---- GO Annotations (new page) ----------------------------------
+    story.append(PageBreak())
+    story += section_header(f"{next_sec}.  Predicted Gene Ontology Annotations")
+    story.append(Paragraph(
+        "Predictions generated by the Tri-Modal Multi-Branch Deep Fusion Network and ranked by "
+        "descending confidence score.  GO identifiers are resolvable at "
+        "http://amigo.geneontology.org  and  https://www.ebi.ac.uk/QuickGO.",
+        sty_body))
+    story.append(Spacer(1, 6))
+
+    for cat_label, cat_col in [
+        ("Molecular Function", "Molecular Function"),
+        ("Biological Process", "Biological Process"),
+        ("Cellular Component", "Cellular Component"),
+    ]:
+        sub = df_results[df_results["Category"] == cat_col].copy()
+        if sub.empty:
+            continue
+        story.append(Paragraph(cat_label, sty_cat_head))
+        story.append(data_table(
+            ["GO Term ID", "Predicted Function", "Score", "Confidence (%)"],
+            [[r["GO_ID"], r["Predicted_Function"],
+              f"{r['Confidence_Score']:.4f}", r["Confidence (%)"]]
+             for _, r in sub.iterrows()],
+            [0.9*inch, 4.3*inch, 0.65*inch, 0.85*inch]
+        ))
+        story.append(Spacer(1, 6))
+
+    # ---- Disclaimer -------------------------------------------------
+    story.append(Spacer(1, 0.18 * inch))
+    story.append(HRFlowable(width="100%", thickness=0.4, color=MEDGRAY))
+    story.append(Spacer(1, 5))
+    story.append(Paragraph(
+        "DISCLAIMER \u2014 This report is generated by an automated computational system. "
+        "Gene Ontology predictions are probabilistic and are intended to support, not replace, "
+        "expert biological interpretation and experimental validation.  Assignments should be "
+        "cross-referenced against primary literature and curated databases (UniProtKB, AmiGO, "
+        "QuickGO) before any clinical, regulatory, or publication use. "
+        "ProteoPredict is a research-grade platform; no warranty is expressed or implied.",
+        sty_disclaimer))
+
+    doc.build(story)
+    return buf.getvalue()
+
 
 
 # --- Streamlit Page Configuration ---
@@ -372,16 +706,20 @@ if run_btn:
                     st.plotly_chart(fig_heat, use_container_width=True)
 
                 with col_exp:
-                    st.markdown("#### Export Scientific Annotation Report")
-                    report_html_str = generate_report_html(clean_seq, source_id, df, custom_threshold)
+                    st.markdown("#### Export Annotation Report")
+                    report_pdf_bytes = generate_report_pdf(
+                        clean_seq, source_id, df, custom_threshold,
+                        motifs_df=motifs_df,
+                        aa_df=aa_df
+                    )
                     st.download_button(
-                        label="⬇️ Download HTML Report (Printable to PDF)",
-                        data=report_html_str,
-                        file_name=f"ProteoPredict_Report_{source_id}.html",
-                        mime="text/html",
+                        label="Download PDF Report",
+                        data=report_pdf_bytes,
+                        file_name=f"ProteoPredict_Report_{source_id}.pdf",
+                        mime="application/pdf",
                         use_container_width=True
                     )
-                    st.caption("Includes analysis parameters, sequence properties, and full GO annotations with evidence links.")
+                    st.caption("Structured PDF report — includes model parameters, benchmark metrics, calibrated thresholds, motif analysis, residue composition, and full GO annotation table.")
 
             else:
                 st.warning(f"No GO terms reached the decision threshold of {custom_threshold:.2f}. Try lowering the confidence slider.")

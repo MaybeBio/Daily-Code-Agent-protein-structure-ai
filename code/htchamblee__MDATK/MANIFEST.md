@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/htchamblee/MDATK
 - 快照日期: 2026-11-22
-- 快照 commit: [`cd62c96cca55`](https://github.com/htchamblee/MDATK/commit/cd62c96cca556d1c32664460c1d155bcee30e491)
+- 快照 commit: [`db6443285fcf`](https://github.com/htchamblee/MDATK/commit/db6443285fcf6edb3f22487b3159c3cdbcd03fdc)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (250 个文件, 6.0 MB)
@@ -12,9 +12,9 @@
 | 源码 | 237 | 5.4 MB |
 | README | 4 | 294.0 KB |
 | 文档 | 4 | 198.8 KB |
-| 构建/配置 | 5 | 115.9 KB |
+| 构建/配置 | 5 | 116.5 KB |
 
-按后缀: `.py` 233 (5.4 MB)、`.md` 6 (456.5 KB)、`.toml` 3 (104.3 KB)、`无后缀` 1 (34.3 KB)、`.sh` 4 (27.2 KB)、`.yml` 1 (9.8 KB)、`.txt` 1 (2.0 KB)、`pyproject.toml` 1 (1.9 KB)
+按后缀: `.py` 233 (5.4 MB)、`.md` 6 (456.5 KB)、`.toml` 3 (104.3 KB)、`无后缀` 1 (34.3 KB)、`.sh` 4 (27.2 KB)、`.yml` 1 (10.3 KB)、`.txt` 1 (2.0 KB)、`pyproject.toml` 1 (1.9 KB)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

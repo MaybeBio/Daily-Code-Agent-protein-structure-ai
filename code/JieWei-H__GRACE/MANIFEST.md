@@ -2,19 +2,19 @@
 
 - 上游仓库: https://github.com/JieWei-H/GRACE
 - 快照日期: 2026-11-22
-- 快照 commit: [`9a2dc7d7c857`](https://github.com/JieWei-H/GRACE/commit/9a2dc7d7c85763e96e61e4fdf1155108d28adf9c)
+- 快照 commit: [`087fae96b453`](https://github.com/JieWei-H/GRACE/commit/087fae96b453e438f16f36e4b4597546a212be1b)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (85 个文件, 783.7 KB)
+## 保留 (86 个文件, 794.7 KB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 82 | 768.7 KB |
-| README | 1 | 13.8 KB |
+| 源码 | 83 | 778.2 KB |
+| README | 1 | 15.3 KB |
 | 文档 | 1 | 1.0 KB |
 | 构建/配置 | 1 | 169 B |
 
-按后缀: `.py` 77 (761.9 KB)、`.md` 1 (13.8 KB)、`.sh` 5 (6.8 KB)、`无后缀` 1 (1.0 KB)、`.txt` 1 (169 B)
+按后缀: `.py` 78 (771.3 KB)、`.md` 1 (15.3 KB)、`.sh` 5 (6.8 KB)、`无后缀` 1 (1.0 KB)、`.txt` 1 (169 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

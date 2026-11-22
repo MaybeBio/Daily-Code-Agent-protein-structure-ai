@@ -27,9 +27,11 @@ cxx-compiler = ">=2.0.0,<3"
 check = { cmd = "python --version && quarto --version", description = "Check that the tools work" }
 # `reproduce` must rebuild every result from the raw data with one command.
 # The lessons replace this placeholder with real steps.
-reproduce = { cmd = "python -c \"print('Nothing to reproduce yet: add your steps to the reproduce task in pixi.toml')\"", description = "Rebuild all results from raw data" }
+reproduce = { depends-on = ["test-pipeline"], description = "Rebuild all results from raw data" }
 download = { cmd = "python scripts/download.py", description = "Download raw data listed in metadata/sources.tsv" }
 setup-orca = { cmd = "python scripts/setup_orca.py", description = "Download, compile and self-test ORCA (pinned commit)" }
+test-pipeline = { cmd = "python scripts/test_pipeline.py", depends-on = ["download", "setup-orca"] }
+select-dataset = { cmd = "python scripts/select_dataset.py", depends-on = ["download"] }
 
 [pypi-dependencies]
 tmtools = ">=0.3.0, <0.4"

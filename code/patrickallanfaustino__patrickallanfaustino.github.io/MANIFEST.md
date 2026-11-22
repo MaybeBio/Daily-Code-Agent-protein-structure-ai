@@ -2,7 +2,7 @@
 
 - 上游仓库: https://github.com/patrickallanfaustino/patrickallanfaustino.github.io
 - 快照日期: 2026-11-22
-- 快照 commit: [`52adfe677346`](https://github.com/patrickallanfaustino/patrickallanfaustino.github.io/commit/52adfe677346a40e7744009881ae18733a2c4a50)
+- 快照 commit: [`11750503db8a`](https://github.com/patrickallanfaustino/patrickallanfaustino.github.io/commit/11750503db8aa874988d27b2d26e6e5f0cccaf8d)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (51 个文件, 7.5 MB)
@@ -14,7 +14,7 @@
 | 构建/配置 | 3 | 5.4 KB |
 | README | 1 | 1.3 KB |
 
-按后缀: `.html` 8 (6.6 MB)、`.ipynb` 14 (672.0 KB)、`.md` 18 (147.1 KB)、`.py` 2 (71.5 KB)、`无后缀` 1 (18.2 KB)、`.toml` 1 (4.4 KB)、`.sh` 3 (1.3 KB)、`.tcl` 1 (804 B)、`.yml` 1 (747 B)、`.js` 1 (389 B)、`.txt` 1 (180 B)
+按后缀: `.html` 8 (6.6 MB)、`.ipynb` 14 (672.0 KB)、`.md` 18 (147.1 KB)、`.py` 2 (71.5 KB)、`无后缀` 1 (18.2 KB)、`.toml` 1 (4.4 KB)、`.sh` 3 (1.3 KB)、`.tcl` 1 (804 B)、`.yml` 1 (747 B)、`.js` 1 (389 B)、`.txt` 1 (182 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

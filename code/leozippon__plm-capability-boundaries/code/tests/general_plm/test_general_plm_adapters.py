@@ -651,3 +651,70 @@ def test_saprot_1_3b_loads_without_contact_head_gpu():
     assert vec.terms.shape == (20,) and np.isfinite(vec.nll_sum)
     del adapter
     torch.cuda.empty_cache()
+
+
+def test_proteinglm_10b_synthesizes_missing_safetensors_index_cpu(tmp_path: Path):
+    """Verify _maybe_derive_proteinglm_mlm_dir synthesizes model.safetensors.index.json from shards."""
+    from safetensors.torch import save_file
+
+    from src.capability.general_plm.adapters import _maybe_derive_proteinglm_mlm_dir
+
+    src = tmp_path / "proteinglm-10b-mlm"
+    src.mkdir()
+    save_file({"layer.0.weight": torch.zeros(2, 2)}, str(src / "model-00001-of-00002.safetensors"))
+    save_file({"layer.1.weight": torch.ones(2, 2)}, str(src / "model-00002-of-00002.safetensors"))
+    (src / "config.json").write_text('{"model_type": "proteinglm"}\n', encoding="utf-8")
+
+    derived = _maybe_derive_proteinglm_mlm_dir(src)
+    assert derived != src
+    assert not (src / "model.safetensors.index.json").exists()
+    idx_path = derived / "model.safetensors.index.json"
+    assert idx_path.is_file()
+    idx = json.loads(idx_path.read_text(encoding="utf-8"))
+    assert idx["weight_map"] == {
+        "layer.0.weight": "model-00001-of-00002.safetensors",
+        "layer.1.weight": "model-00002-of-00002.safetensors",
+    }
+    assert idx["metadata"]["total_size"] > 0
+
+
+def test_prime_690m_strips_external_automap_prefix_and_disables_flash_attention_cpu(tmp_path: Path):
+    """Verify _maybe_derive_local_automap_dir strips stale HF prefix, disables flash_attention,
+    and relocates deprecated transformers.modeling_utils prune imports cleanly."""
+    from src.capability.general_plm.adapters import _maybe_derive_local_automap_dir
+
+    src = tmp_path / "Prime_690M"
+    src.mkdir()
+    orig_cfg = {
+        "model_type": "proprime",
+        "flash_attention": True,
+        "auto_map": {
+            "AutoModelForMaskedLM": "AI4Protein/ProPrime_650M--modeling_proprime.ProPrimeForMaskedLM"
+        },
+    }
+    (src / "config.json").write_text(json.dumps(orig_cfg), encoding="utf-8")
+    (src / "modeling_proprime.py").write_text(
+        "from transformers.modeling_utils import (\n"
+        "    PreTrainedModel,\n"
+        "    find_pruneable_heads_and_indices,\n"
+        "    prune_linear_layer,\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    derived = _maybe_derive_local_automap_dir(src)
+    assert derived != src
+    # Source config remains untouched
+    assert json.loads((src / "config.json").read_text(encoding="utf-8"))["flash_attention"] is True
+    # Derived config strips external repo prefix and disables flash_attention
+    new_cfg = json.loads((derived / "config.json").read_text(encoding="utf-8"))
+    assert new_cfg["auto_map"]["AutoModelForMaskedLM"] == "modeling_proprime.ProPrimeForMaskedLM"
+    assert new_cfg["flash_attention"] is False
+    # Patched modeling_proprime.py executes cleanly under installed transformers 4.57+
+    patched_src = (derived / "modeling_proprime.py").read_text(encoding="utf-8")
+    assert "from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer" in patched_src
+    ns: dict[str, object] = {}
+    exec(compile(patched_src, str(derived / "modeling_proprime.py"), "exec"), ns)
+    assert callable(ns["find_pruneable_heads_and_indices"])
+    assert callable(ns["prune_linear_layer"])
+    assert ns["PreTrainedModel"] is not None

@@ -2,18 +2,18 @@
 
 - 上游仓库: https://github.com/yoonalimsuwan/REAL-FOLD-ONE
 - 快照日期: 2026-11-22
-- 快照 commit: [`394841d4d834`](https://github.com/yoonalimsuwan/REAL-FOLD-ONE/commit/394841d4d8349c06d1a8b8d6101c7f0fac65dd0f)
+- 快照 commit: [`4d4164c856d2`](https://github.com/yoonalimsuwan/REAL-FOLD-ONE/commit/4d4164c856d287f7f8b057b56529c4e17686a9a9)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (383 个文件, 12.7 MB)
+## 保留 (392 个文件, 13.3 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 368 | 12.5 MB |
+| 源码 | 377 | 13.1 MB |
 | README | 12 | 196.1 KB |
 | 文档 | 3 | 20.3 KB |
 
-按后缀: `.py` 365 (12.5 MB)、`.md` 14 (215.3 KB)、`.cu` 1 (12.9 KB)、`.sh` 2 (2.1 KB)、`无后缀` 1 (1.0 KB)
+按后缀: `.py` 374 (13.0 MB)、`.md` 14 (215.3 KB)、`.cu` 1 (12.9 KB)、`.sh` 2 (2.1 KB)、`无后缀` 1 (1.0 KB)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

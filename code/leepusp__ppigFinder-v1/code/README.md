@@ -1,144 +1,62 @@
 <div align="center">
 
-# ppigFinder
+# ppigfinder
 
 **Protein–Protein Interaction Genomic Finder**
 
-**From bacterial genomes to biologically informed protein–protein interaction candidates.**
+[![MIT license](https://img.shields.io/badge/license-MIT-34a853.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776ab.svg)](pyproject.toml)
+[![PyQt6 desktop](https://img.shields.io/badge/desktop-PyQt6-5267b2.svg)](docs/user_manual/installation.md)
+[![Documentation](https://img.shields.io/badge/docs-MkDocs-4257ad.svg)](https://leepusp.github.io/ppigfinder/)
+[![bioRxiv preprint](https://img.shields.io/badge/bioRxiv-preprint-b31b1b.svg)](https://doi.org/10.64898/2026.08.23.746524)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-34a853.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%20recommended-3776ab.svg)](pyproject.toml)
-[![UI](https://img.shields.io/badge/desktop-PyQt6-5267b2.svg)](docs/user_manual/installation.md)
-[![Docs](https://img.shields.io/badge/documentation-MkDocs-4257ad.svg)](https://leepusp.github.io/ppigFinder-v1/)
-[![Preprint](https://img.shields.io/badge/bioRxiv-preprint-b31b1b.svg)](https://doi.org/10.64898/2026.08.23.746524)
+[Install](#install) · [Screenshots](#interface-gallery) · [Manual](https://leepusp.github.io/ppigfinder/)
 
-[**Install**](#install-from-source) · [**Features**](#what-you-can-do) · [**Screenshots**](#interface-gallery) · [**Workflow**](#scientific-workflow) · [**Manual**](https://leepusp.github.io/ppigFinder-v1/) · [**Paper**](https://doi.org/10.64898/2026.08.23.746524)
-
-![Scientific workflow: genome, ORFs, annotation, genomic context, design, prediction and analysis](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/figures/pipeline.svg)
-
-*Conceptual workflow diagram. Execution backends are optional; structural prediction is not required for genome annotation.*
+![Workflow from genome import and ORF prediction to structural results](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/figures/pipeline.svg)
 
 </div>
 
-ppigFinder is an open-source desktop application designed to connect **bacterial genome exploration**, **functional annotation**, **genomic-neighborhood reasoning**, **candidate interaction design**, and **structural-prediction result interpretation**. The application is written in Python and includes a PyQt interface. Researchers can prepare input for **AlphaFold Server** without a cluster, or configure local and remote execution separately when appropriate.
+ppigfinder is a desktop application for exploring bacterial genomes and prioritizing protein–protein interaction candidates. It runs on Windows, Linux and macOS.
 
-> **Release scope.** This repository includes the application imported from `leepusp/ppigfinder` (software metadata v2.9.14), plus new visual documentation. The diagrams are explanatory; screenshots from the supplied guide show an **earlier v2.2 interface**, and do not certify every control in v2.9.14. Verify optional tools and HPC workflows against your local installation.
+## What it does
 
-## What you can do
+- Load genomes and predict open reading frames (ORFs).
+- Annotate proteins with BLAST+ and HMMER and inspect genomic neighborhoods.
+- Build protein pairs and complexes, export AlphaFold Server or native AlphaFold 3 inputs, and import structural results.
+- Transfer files over SFTP and manage jobs from a configured Slurm host.
 
-| | Capability | Typical use |
-|:---:|---|---|
-| 🧬 | **Genome input and ORF prediction** | Load bacterial sequence data, predict coding sequences with Pyrodigal or alternate strategies, and inspect protein products. |
-| 🔎 | **Sequence and domain annotation** | Find homologs with BLAST+ and domains with HMMER, including fallback components where supported. |
-| 🧭 | **Genomic context** | Explore nearby ORFs and prioritize biologically motivated interaction candidates. |
-| 🧩 | **PPI job design** | Build selected pairs, neighborhood screens, homodimers and custom protein-chain combinations. |
-| 🌐 | **AlphaFold Server export** | Generate server-compatible JSON and submit manually through the website, without requiring HPC. |
-| 🖥️ | **AF3 / compute workflows** | Prepare native AF3 inputs and optional cluster scripts, subject to runner and scheduler configuration. |
-| 📈 | **Structural-confidence analysis** | Import result directories and review ipTM, PAE, scores and interface/contact summaries where available. |
-| 📂 | **Reproducible outputs** | Export FASTA, tables, jobs and project artifacts for further analysis. |
-
-**Important:** tools, profiles, and experimental modules are not all equivalent to a fully validated end-to-end workflow. See [implemented vs planned](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/developer/feature_status.md).
+Genome analysis and input preparation run locally. Structural inference needs a configured prediction engine and its data.
 
 ## Interface gallery
 
-The images below come from the **earlier user guide (ppigFinder v2.2)**. They document the UI lineage but may differ from the current packaged v2.9.14 build. For a structure schematic, see [interface tour](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/interface_tour.md).
+Screenshots from the v2.2 user guide. See the [interface tour](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/interface_tour.md) for the current layout.
 
-| Genome and predicted ORFs | BLAST inspection |
-|---|---|
-| [![Historical genome and ORF interface](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-orf-prediction.webp)](docs/assets/screenshots/legacy-orf-prediction.webp) | [![Historical BLAST results interface](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-blast.webp)](docs/assets/screenshots/legacy-blast.webp) |
-| HMM/domain annotation | Structural job creation |
-| [![Historical HMM inspection interface](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-hmmer.webp)](docs/assets/screenshots/legacy-hmmer.webp) | [![Historical AlphaFold job list](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-af3-pairs.webp)](docs/assets/screenshots/legacy-af3-pairs.webp) |
+| Genome and ORFs | BLAST results |
+| --- | --- |
+| [![Genome and ORF view](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-orf-prediction.webp)](docs/assets/screenshots/legacy-orf-prediction.webp) | [![BLAST results view](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-blast.webp)](docs/assets/screenshots/legacy-blast.webp) |
+| **HMM annotation** | **AlphaFold job design** |
+| [![HMM annotation view](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-hmmer.webp)](docs/assets/screenshots/legacy-hmmer.webp) | [![AlphaFold job design view](https://github.com/leepusp/ppigFinder-v1/raw/HEAD/docs/assets/screenshots/legacy-af3-pairs.webp)](docs/assets/screenshots/legacy-af3-pairs.webp) |
 
-## Install from source
+## Install
 
-**Required:** Python **3.11+**, a graphical desktop and a local virtual environment. Local AF3 inference is optional; the app does not ship model parameters, databases or inference executables.
-
-### Linux / macOS
+**Conda or Mamba** (run from a source checkout):
 
 ```bash
-git clone https://github.com/leepusp/ppigFinder-v1.git
-cd ppigFinder-v1
-python3 scripts/install_ppigfinder.py
+git clone https://github.com/leepusp/ppigfinder.git
+cd ppigfinder
+conda create -n ppigfinder -c conda-forge python=3.11 pip
+conda run -n ppigfinder python -m pip install ".[gui,recommended]"
+conda run -n ppigfinder ppigfinder
 ```
 
-### Windows PowerShell
-
-```powershell
-git clone https://github.com/leepusp/ppigFinder-v1.git
-cd ppigFinder-v1
-py -3.11 scripts/install_ppigfinder.py
-```
-
-On Windows, you can also double-click `scripts/Install ppigFinder.vbs` in File Explorer. Add `--terminal` to either Python command for installation from a shell. BLAST+ and HMMER are installed separately. See [installation](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/installation.md) and [troubleshooting](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/troubleshooting.md).
-
-## Scientific workflow
-
-1. **Load a bacterial genome**, for example *Xanthomonas citri* strain 306 (NCBI `AE008923.1`).
-2. **Predict ORFs** and inspect genomic coordinates and protein sequences.
-3. **Annotate** candidates by sequence similarity and HMM-profile searches.
-4. **Inspect neighborhoods** and choose interaction hypotheses.
-5. **Generate selected pairs or complexes** and export them in a format suitable for the chosen prediction backend.
-6. **Run externally or on available compute**; for AlphaFold Server, the upload step remains manual.
-7. **Import structural predictions**, evaluate confidence metrics, and report results with genomic context.
-
-The preprint reports 4,303 predicted chromosomal ORFs in the demonstration dataset and a VirD4-centered screening strategy. These are **study-specific results**, not hard-coded outputs of the software. See the [walkthrough](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/tutorials/xanthomonas.md) and [preprint](https://doi.org/10.64898/2026.08.23.746524).
-
-## Prediction and execution are separate decisions
-
-```mermaid
-flowchart LR
-  A[Genome / selected protein sequences] --> B[PPI candidate and job builder]
-  B --> C{Prediction format / engine}
-  C --> D[AlphaFold Server JSON]
-  C --> E[Local AF3 input]
-  C --> F[Other experimental input writers]
-  D --> G[Manual web submission]
-  E --> H{Execution environment}
-  H --> I[Local runner]
-  H --> J[HPC via configured scheduler]
-  F --> K[Backend-specific validation needed]
-  G --> L[Result import and analysis]
-  I --> L
-  J --> L
-```
-
-Core genomic analysis works without a GPU, SSH or Slurm. HPC execution uses cluster settings supplied by the user. See [execution architecture](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/developer/feature_status.md).
+Replace `conda` with `mamba` in these commands if you use Mamba. The [installation guide](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/installation.md) also covers the downloadable wheel, the graphical installer and Python virtual environments.
 
 ## Documentation
 
-| Guide | Coverage |
-|---|---|
-| [Complete user guide](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/complete_guide.md) | Setup, genomes, ORFs, annotation, interaction jobs, export and interpretation. |
-| [Interface tour](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/interface_tour.md) | Annotated schematic and historical screenshots. |
-| [Xanthomonas tutorial](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/tutorials/xanthomonas.md) | Reproducible study-inspired walkthrough. |
-| [AlphaFold Server and AF3](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/alphafold.md) | Distinct JSON dialects, manual server submission and result import. |
-| [AF3 install and local runner](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/af3_local_installation.md) | Native AF3 export, optional official/Docker/wrapper inference, CLI and GUI setup. |
-| [Local / HPC execution](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/hpc_submission.md) | Optional compute configuration and validation checks. |
-| [Optional remote connections](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/remote_connections.md) | User-owned SSH profiles, verified SFTP uploads/downloads; no job submission. |
-| [Implementation status](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/developer/feature_status.md) | Implemented, provisional and not-yet-validated pathways. |
-| [Website](https://leepusp.github.io/ppigFinder-v1/) | Public, searchable MkDocs documentation. |
+- [User guide](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/complete_guide.md) and [worked example](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/tutorials/xanthomonas.md)
+- [AlphaFold 3 setup](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/af3_local_installation.md) and [Slurm execution](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/user_manual/hpc_submission.md)
+- [Project status](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/docs/developer/feature_status.md) and [contributing](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/CONTRIBUTING.md)
 
-## Repository layout
+## Citation and license
 
-```text
-ppigFinder-v1/
-├── ppigfinder/               # application modules and GUI
-│   ├── bioseq/ annotation/ neighborhood/
-│   ├── alphafold/ structure_prediction/
-│   ├── services/ ui/ hpc/ integrations/af3/
-│   └── ...
-├── scripts/                  # developer checks and optional runner templates
-├── docs/                     # manuals, diagrams and historical screenshots
-├── main.py                   # desktop entry point
-├── pyproject.toml            # package metadata and optional dependencies
-├── CITATION.cff / LICENSE    # attribution and MIT license
-└── mkdocs.yml                # documentation portal
-```
-
-## Citation, development and license
-
-- **Paper:** Oka, Adan, Calomeno & de Souza (2026). *ppigFinder: an integrated desktop application for bacterial genome annotation and AlphaFold 3-based protein–protein interaction screening*. **bioRxiv**, [doi:10.64898/2026.08.23.746524](https://doi.org/10.64898/2026.08.23.746524).
-- **Software:** use [`CITATION.cff`](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/CITATION.cff) for software-version author metadata.
-- **Source of historical versions:** [`leepusp/ppigfinder`](https://github.com/leepusp/ppigfinder). This repository is the v1 public distribution line.
-- **License:** [MIT](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/LICENSE). External tools, models, and databases retain their own licenses; neither AF3 weights nor proprietary databases are bundled.
-- **Contributing:** [CONTRIBUTING.md](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/CONTRIBUTING.md) · **Security:** [SECURITY.md](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/SECURITY.md) · **Changelog:** [CHANGELOG.md](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/CHANGELOG.md).
+Cite the software using [CITATION.cff](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/CITATION.cff). The workflow is described in the [bioRxiv preprint](https://doi.org/10.64898/2026.08.23.746524). ppigfinder is released under the [MIT License](https://github.com/leepusp/ppigFinder-v1/blob/HEAD/LICENSE).
