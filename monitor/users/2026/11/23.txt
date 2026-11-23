@@ -1,0 +1,13 @@
+Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777coder, Barakhsaana, Zuricho, Immortals-33, weitinging, ji-xiaoyue, Zirui-Fan, borrytod, xlab-BioAI, SII-ShenggengLin, xtanh, wangwrx, shaowenguang, mapleleaf6, tyang816, mingchen-li, code4luck, zy-zhou, riacd, terry-r123, bzho3923, Xinheng-He, lujiarui, ChenDdon, AspirinCode, bjing2016, prokia, Gonglab-THU, meneshail, xinshi-chen, amyxlu, LirongWu, OdinZhang, EDAPINENUT, QizhiPei, thematrixmaster, zaixizhang, pascalnotin, jsunn-y, Leo-T-Zang, WillHua127, wenjiegroup, Shenggan, yangnianzu0515, chao1224, blt2114, Oxer11, shichence, ChrisAllenMing, jchodera, jgreener64, HannesStark, Peldom, luost26, sokrypton, lmqfly...
+
+2026-11-23 07:17:02 | 🚀 sokrypton pushed to sokrypton/aoe-beta
+    - [beaedf4] (expanded) Deploy 7b876c2: 3D: outlines for buildings behind trees, buildings stand level on slopes
+2026-11-23 01:17:59 | 💬 jchodera created issue 'Energy and Entropy uncertainties underestimated when reweighting to wider unsampled state' in choderalab/pymbar
+2026-11-23 00:11:27 | 🚀 sokrypton pushed to sokrypton/aoe-beta
+    - [85cbc83] (expanded) Deploy f783f3a: AI audit fixes: houses past the cap, housing throttle, wood beyond a bare town, corner squeeze
+2026-11-22 22:47:12 | 🚀 sokrypton pushed to sokrypton/aoe-beta
+    - [f0c2f06] (expanded) Deploy 1f79be6: AI camps keep their distance from earlier camps
+2026-11-22 14:57:18 | 🚀 sokrypton pushed to sokrypton/aoe-beta
+    - [17ebf99] (expanded) Deploy 309954d: sleeping dragon hidden by fog
+2026-11-22 03:51:43 | 🚀 sokrypton pushed to sokrypton/aoe-beta
+    - [bf2780e] (expanded) Deploy d7ec2f0: new main menu, Match Setup and Settings; player list top-left
