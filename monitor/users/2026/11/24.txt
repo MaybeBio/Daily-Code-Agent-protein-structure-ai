@@ -1,0 +1,56 @@
+Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777coder, Barakhsaana, Zuricho, Immortals-33, weitinging, ji-xiaoyue, Zirui-Fan, borrytod, xlab-BioAI, SII-ShenggengLin, xtanh, wangwrx, shaowenguang, mapleleaf6, tyang816, mingchen-li, code4luck, zy-zhou, riacd, terry-r123, bzho3923, Xinheng-He, lujiarui, ChenDdon, AspirinCode, bjing2016, prokia, Gonglab-THU, meneshail, xinshi-chen, amyxlu, LirongWu, OdinZhang, EDAPINENUT, QizhiPei, thematrixmaster, zaixizhang, pascalnotin, jsunn-y, Leo-T-Zang, WillHua127, wenjiegroup, Shenggan, yangnianzu0515, chao1224, blt2114, Oxer11, shichence, ChrisAllenMing, jchodera, jgreener64, HannesStark, Peldom, luost26, sokrypton, lmqfly...
+
+2026-11-24 02:06:46 | 🚀 jgreener64 pushed to JuliaMolSim/Molly.jl
+    - [024951c] (expanded) build based on 94b6146
+2026-11-24 00:59:29 | 🚀 sokrypton pushed to sokrypton/aoe
+    - [f1a94fa] (expanded) The ridden dragon aims its fire at its target, and the flame stays on it (NET 44)
+2026-11-24 00:14:51 | 🔹 jgreener64 performed PullRequestReviewEvent on JuliaMolSim/Molly.jl
+2026-11-24 00:14:49 | 🔹 jgreener64 performed PullRequestReviewEvent on JuliaMolSim/Molly.jl
+2026-11-24 00:12:04 | 🔹 jgreener64 performed PullRequestReviewCommentEvent on JuliaMolSim/Molly.jl
+2026-11-24 00:08:48 | 🔹 jgreener64 performed PullRequestReviewCommentEvent on JuliaMolSim/Molly.jl
+2026-11-24 00:05:17 | 🔹 jgreener64 performed PullRequestReviewCommentEvent on JuliaMolSim/Molly.jl
+2026-11-23 23:56:25 | 🚀 jgreener64 pushed to JuliaMolSim/Molly.jl
+    - [e78f76c] (expanded) build based on aadbc0a
+2026-11-23 23:52:44 | 🚀 jgreener64 pushed to JuliaMolSim/Molly.jl
+    - [aadbc0a] (expanded) hide test warning
+2026-11-23 22:09:19 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 22:09:18 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 22:08:57 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [509622c] (expanded) Fix: Exclude a concurrent fetch for the whole Qwen3.8-27B checkpoint load
+2026-11-23 21:59:20 | 🚀 jgreener64 pushed to BioJulia/BioStructures.jl
+    - [ff401ac] (expanded) build based on 5c75121
+2026-11-23 21:58:09 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:08 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:06 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:05 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:03 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:02 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 21:58:00 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 21:57:59 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 21:57:58 | 🔹 Shenggan performed PullRequestReviewEvent on hw-native-sys/pypto-lib
+2026-11-23 21:57:57 | 🔹 Shenggan performed PullRequestReviewCommentEvent on hw-native-sys/pypto-lib
+2026-11-23 21:55:05 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [1029ad3] (expanded) Fix: Guard the a5 bench stage and harden Qwen3.8-27B checkpoint fetching
+2026-11-23 21:55:02 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [3ed4068] (expanded) Fix: Guard the a5 bench stage and harden Qwen3.8-27B checkpoint fetching
+2026-11-23 21:50:48 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [2974684] (expanded) Fix: Guard the a5 bench stage and harden Qwen3.8-27B checkpoint fetching
+2026-11-23 21:50:41 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [2f21020] (expanded) Fix: Guard the a5 bench stage and harden Qwen3.8-27B checkpoint fetching
+2026-11-23 21:04:56 | 💬 Shenggan created issue 'Add: Support checkpoint-compatible Qwen3.8-27B GDN prefill' in hw-native-sys/pypto-lib
+2026-11-23 19:16:20 | ⭐️ Immortals-33 starred enmingxing244/AF_ClaSeq
+2026-11-23 18:39:10 | 💬 jgreener64 created issue 'Fixes HMR with molecules containing virtual sites' in JuliaMolSim/Molly.jl
+2026-11-23 18:15:04 | 🚀 Shenggan pushed to Shenggan/pypto-lib
+    - [213a4cb] (expanded) Add: Compose packed Qwen3.8-27B text prefill
+2026-11-23 17:16:37 | 🔀 Shenggan opened PR in Shenggan/pypto-lib
+2026-11-23 17:14:20 | 🔀 Shenggan opened PR in Shenggan/pypto-lib
+2026-11-23 17:11:32 | 🔀 Shenggan opened PR in hw-native-sys/pypto-lib
+2026-11-23 16:54:44 | ⭐️ Immortals-33 starred bwicky/oligomer_hallucination
+2026-11-23 15:16:10 | 🚀 AspirinCode pushed to AspirinCode/awesome-AI4MolConformation-MD
+    - [f9fab79] (expanded) Update README.md
+2026-11-23 14:31:07 | 🚀 AspirinCode pushed to AspirinCode/awesome-AI4MolConformation-MD
+    - [e78607f] (expanded) Update README.md
+2026-11-23 13:59:54 | 🚀 AspirinCode pushed to AspirinCode/awesome-AI4MolConformation-MD
+    - [da90c1e] (expanded) Update README.md
+2026-11-23 11:43:16 | ⭐️ Immortals-33 starred YuzheWangPKU/awesome-protein-ligand-interactions
+2026-11-23 01:17:59 | 💬 jchodera created issue 'Energy and Entropy uncertainties underestimated when reweighting to wider unsampled state' in choderalab/pymbar
